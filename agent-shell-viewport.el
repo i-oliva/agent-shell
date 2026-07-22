@@ -62,6 +62,7 @@
 (declare-function agent-shell-queue-request "agent-shell")
 (declare-function agent-shell-remove-pending-request "agent-shell")
 (declare-function agent-shell-resume-pending-requests "agent-shell")
+(declare-function agent-shell-status "agent-shell")
 (declare-function agent-shell-view-acp-logs "agent-shell")
 (declare-function agent-shell-view-traffic "agent-shell")
 (declare-function agent-shell-next-permission-button "agent-shell")
@@ -1055,7 +1056,7 @@ VIEWPORT-BUFFER is the viewport buffer to check."
                              :viewport-buffer viewport-buffer
                              :no-error t)))
     (with-current-buffer shell-buffer
-      shell-maker--busy)))
+      (memq (agent-shell-status) '(busy blocked)))))
 
 (defvar agent-shell-viewport-edit-mode-map
   (let ((map (make-sparse-keymap)))
