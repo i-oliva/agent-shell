@@ -26,8 +26,9 @@
 ;;
 ;; session/push: Server-initiated prompt push.  The server sends
 ;; a request to the client, followed by session/update notifications,
-;; concluded by an session_push_end notification.  The client
-;; then responds to the original request.
+;; concluded by a session_push_end notification.  The client
+;; acknowledges the request immediately, keeps it active while updates
+;; arrive, then clears it when the end notification is received.
 
 ;;; Code:
 
@@ -42,12 +43,45 @@
 
 (defvar agent-shell-show-busy-indicator)
 
+(defun agent-shell-experimental--session-push-active-p (state)
+  "Return non-nil when STATE has an active inbound session push."
+  (seq-find (lambda (request)
+              (equal (map-elt request :method) "session/push"))
+            (map-elt state :active-requests)))
+
+(defun agent-shell-experimental--clear-session-push (state)
+  "Remove any active inbound session push from STATE.
+Stop its heartbeat and return non-nil when a push was removed."
+  (when (agent-shell-experimental--session-push-active-p state)
+    (map-put! state :active-requests
+              (seq-remove (lambda (request)
+                            (equal (map-elt request :method) "session/push"))
+                          (map-elt state :active-requests)))
+    (agent-shell-heartbeat-stop
+     :heartbeat (map-elt state :heartbeat))
+    t))
+
+(defun agent-shell-experimental--watch-session-push-process (state)
+  "Clear STATE's active session push when its ACP process exits."
+  (when-let* ((process (map-nested-elt state '(:client :process)))
+              ((processp process))
+              ((not (process-get process 'agent-shell-session-push-watched))))
+    (let ((sentinel (process-sentinel process)))
+      (process-put process 'agent-shell-session-push-watched t)
+      (set-process-sentinel
+       process
+       (lambda (process event)
+         (when (memq (process-status process) '(exit signal))
+           (agent-shell-experimental--clear-session-push state))
+         (when sentinel
+           (funcall sentinel process event)))))))
+
 (cl-defun agent-shell-experimental--on-session-push-request (&key state acp-request)
   "Handle an incoming session/push ACP-REQUEST with STATE.
 
 The server pushes a prompt to the client, followed by session/update
-notifications.  The client sends the response after receiving an
-session_push_end notification.
+notifications.  The client immediately acknowledges an accepted request
+but keeps it active until receiving a session_push_end notification.
 
 If the client is busy (an active session/prompt or session/push is
 in progress), the request is immediately rejected with an error."
@@ -68,12 +102,17 @@ in progress), the request is immediately rejected with an error."
         (nconc state (list (cons :active-requests nil))))
       (map-put! state :active-requests
                 (cons request (map-elt state :active-requests))))
+    (agent-shell-experimental--watch-session-push-process state)
     ;; Remove trailing empty shell prompt before push notifications render.
     (agent-shell-experimental--remove-trailing-prompt)
     (when agent-shell-show-busy-indicator
       (agent-shell-heartbeat-start
        :heartbeat (map-elt state :heartbeat)))
-    (map-put! state :last-entry-type "session/push")))
+    (map-put! state :last-entry-type "session/push")
+    (acp-send-response
+     :client (map-elt state :client)
+     :response (agent-shell-experimental--make-session-push-response
+                :request-id (map-elt acp-request 'id)))))
 
 (defun agent-shell-experimental--remove-trailing-prompt ()
   "Remove the trailing empty shell prompt if it is at end of buffer."
@@ -87,22 +126,11 @@ in progress), the request is immediately rejected with an error."
 (cl-defun agent-shell-experimental--on-session-push-end (&key state on-finished)
   "Handle session_push_end notification with STATE.
 
-Finds the active push prompt request, sends the response, and
-removes it from active requests.  Calls ON-FINISHED when done
+Finds the already-acknowledged active push and removes it from active
+requests without sending a second response.  Calls ON-FINISHED when done
 to allow the caller to finalize (e.g. display a new shell prompt)."
-  (when-let* ((push-request (seq-find (lambda (r)
-                                        (equal (map-elt r :method) "session/push"))
-                                      (map-elt state :active-requests))))
-    (acp-send-response
-     :client (map-elt state :client)
-     :response (agent-shell-experimental--make-session-push-response
-                :request-id (map-elt push-request :id)))
-    (map-put! state :active-requests
-              (seq-remove (lambda (r)
-                            (equal (map-elt r :method) "session/push"))
-                          (map-elt state :active-requests)))
-    (agent-shell-heartbeat-stop
-     :heartbeat (map-elt state :heartbeat))
+  (when (agent-shell-experimental--session-push-active-p state)
+    (agent-shell-experimental--clear-session-push state)
     (map-put! state :last-entry-type "session_push_end")
     (when on-finished
       (funcall on-finished))))

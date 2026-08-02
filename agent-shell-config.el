@@ -144,6 +144,18 @@ For example:
                   matches)
         (car matches))))
 
+(defun agent-shell--session-mode-config-option (state)
+  "Return the config option backing session modes in STATE, or nil.
+
+Agents may use a category other than the ACP default \"mode\" when their
+legacy session modes mirror another config option.  The agent config can
+declare that category with :session-mode-config-category."
+  (agent-shell--config-option-by-category
+   state
+   (or (map-nested-elt state
+                       '(:agent-config :session-mode-config-category))
+       "mode")))
+
 (defun agent-shell--select-config-options (state)
   "Return selectable (type = \"select\") config options from STATE."
   (seq-filter (lambda (option)
@@ -217,9 +229,9 @@ session :model-id."
 (defun agent-shell--current-mode-id (state)
   "Return current mode ID from STATE.
 
-Prefers config option with category \"mode\", falls back to
+Prefers the config option backing session modes, falling back to
 session :mode-id."
-  (or (map-elt (agent-shell--config-option-by-category state "mode") :current-value)
+  (or (map-elt (agent-shell--session-mode-config-option state) :current-value)
       (map-nested-elt state '(:session :mode-id))))
 
 (defun agent-shell--current-thought-level-id (state)

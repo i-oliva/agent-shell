@@ -128,6 +128,18 @@ Optionally: You may also need [[https://code.claude.com/docs/en/overview][Claude
 
 For OpenAI's Codex, install [[https://github.com/agentclientprotocol/codex-acp][@agentclientprotocol/codex-acp]] (=npm install -g @agentclientprotocol/codex-acp=) and ensure the =codex-acp= executable is in PATH.
 
+*** OpenClaw
+
+For OpenClaw, install the OpenClaw CLI and configure an OpenClaw Gateway before starting =agent-shell=. =agent-shell= starts OpenClaw with the official ACP bridge command:
+
+#+begin_src bash
+openclaw acp
+#+end_src
+
+See [[https://docs.openclaw.ai/start/wizard][OpenClaw setup]] and [[https://docs.openclaw.ai/cli/acp][OpenClaw ACP bridge docs]] for Gateway, authentication, and supported =openclaw acp= flags. You can add supported flags (for example Gateway URL/session flags) by customizing =agent-shell-openclaw-acp-command=.
+
+OpenClaw's ACP bridge is Gateway-backed and does not support per-session =mcpServers= from the ACP client. Leave =agent-shell-mcp-servers= nil for OpenClaw and configure MCP on the OpenClaw Gateway/agent instead.
+
 *** Gemini CLI
 
 For Google's [[https://github.com/google-gemini/gemini-cli][Gemini CLI]], be sure to get a recent release supporting the =--experimental-acp= flag.
@@ -467,6 +479,21 @@ For API key authentication:
        :api-key (lambda () (auth-source-pass-get 'secret "openai-api-key"))))
 #+end_src
 
+*** OpenClaw
+
+OpenClaw authentication and model/session behavior are configured by the OpenClaw Gateway or supported =openclaw acp= flags. =agent-shell= intentionally provides only command and environment customizations for this backend:
+
+#+begin_src emacs-lisp
+(setq agent-shell-openclaw-acp-command
+      '("openclaw" "acp"))
+
+(setq agent-shell-openclaw-environment
+      (agent-shell-make-environment-variables
+       "OPENCLAW_GATEWAY_TOKEN" (auth-source-pass-get 'secret "openclaw-gateway-token")))
+#+end_src
+
+Do not set =agent-shell-mcp-servers= for OpenClaw; configure MCP servers in the OpenClaw Gateway/agent because the OpenClaw ACP bridge does not accept client-provided per-session MCP servers.
+
 *** Goose
 
 By default, authentication is handled by Goose's built-in configuration.
@@ -635,7 +662,7 @@ Huge thanks for /gdindi/ for finding and and describing this in https://github.c
 
 *** Customizing Available Agents
 
-By default, =agent-shell= includes configurations for all supported agents (Claude Agent, Gemini CLI, Codex, Goose, Grok Build, Cursor, CodeBuddy, Qwen Code, and Auggie). You can customize which agents are available through the =agent-shell-agent-configs= variable.
+By default, =agent-shell= includes configurations for all supported agents (Claude Agent, Gemini CLI, Codex, OpenClaw, Goose, Grok Build, Cursor, CodeBuddy, Qwen Code, and Auggie). You can customize which agents are available through the =agent-shell-agent-configs= variable.
 
 ** Usage
 
@@ -653,6 +680,7 @@ Start a specific agent shell session directly:
 - =M-x agent-shell-auggie-start-agent= - Start an Auggie agent session
 - =M-x agent-shell-codebuddy-start-agent= - Start a CodeBuddy agent session
 - =M-x agent-shell-openai-start-codex= - Start a Codex agent session
+- =M-x agent-shell-openclaw-start-agent= - Start an OpenClaw agent session
 - =M-x agent-shell-google-start-gemini= - Start a Gemini agent session
 - =M-x agent-shell-goose-start-agent= - Start a Goose agent session
 - =M-x agent-shell-xai-start-grok= - Start a Grok Build (xAI) agent session
@@ -929,6 +957,8 @@ always go to Evil modes if you need to with ~C-z~).
 | agent-shell-openai-authentication             | Configuration for OpenAI authentication.                                        |
 | agent-shell-openai-codex-acp-command          | Command and parameters for the OpenAI Codex client.                             |
 | agent-shell-openai-codex-environment          | Environment variables for the OpenAI Codex client.                              |
+| agent-shell-openclaw-acp-command              | Command and parameters for the OpenClaw ACP client.                             |
+| agent-shell-openclaw-environment              | Environment variables for the OpenClaw ACP client.                              |
 | agent-shell-openai-default-model-id           | Default Codex model ID.                                                         |
 | agent-shell-openai-default-session-mode-id    | Default Codex session mode ID.                                                  |
 | agent-shell-opencode-acp-command              | Command and parameters for the OpenCode client.                                 |
@@ -1033,6 +1063,7 @@ always go to Evil modes if you need to with ~C-z~).
 |                 | agent-shell-next-permission-button                      | Jump to the next button.                                                      |
 |                 | agent-shell-open-transcript                             | Open the transcript file for the current `agent-shell' buffer.                |
 |                 | agent-shell-openai-start-codex                          | Start an interactive Codex agent shell.                                       |
+|                 | agent-shell-openclaw-start-agent                        | Start an interactive OpenClaw agent shell.                                    |
 |                 | agent-shell-opencode-start-agent                        | Start an interactive OpenCode agent shell.                                    |
 | C-c C-o         | agent-shell-other-buffer                                | Switch to other associated buffer (viewport vs shell).                        |
 | C-<up> or M-p   | agent-shell-previous-input                              | Cycle backwards through input history, saving input.                          |
@@ -1142,6 +1173,7 @@ If you're able to determine the agent is missing a feature (or a bug is present)
 - [[https://github.com/zed-industries/codex-acp][codex-acp]]: For Codex.
 - [[https://github.com/google-gemini/gemini-cli][Gemini CLI]].
 - [[https://block.github.io/goose/docs/getting-started/installation][Goose]].
+- [[https://docs.openclaw.ai/cli/acp][OpenClaw ACP bridge docs]] / [[https://github.com/openclaw/openclaw/issues][OpenClaw issues]]: For OpenClaw ACP bridge and Gateway-backed agent issues.
 - [[https://github.com/QwenLM/qwen-code][Qwen Code]].
 
 *** =agent-shell= issues or feature requests

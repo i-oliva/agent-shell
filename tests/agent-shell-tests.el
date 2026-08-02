@@ -593,7 +593,8 @@ block -- covering the dispatch path, not just the helper in isolation."
       (should (equal rendered "hello"))
 
       ;; Image content block with a uri -> a markdown image, not a dropped
-      ;; or text-only chunk.
+      ;; or text-only chunk.  Streaming continuations hand the accumulated
+      ;; body to the UI so renderers can recompute the whole visible block.
       (agent-shell--on-notification
        :state state
        :acp-notification '((method . "session/update")
@@ -603,7 +604,7 @@ block -- covering the dispatch path, not just the helper in isolation."
                              (content (type . "image")
                                       (mimeType . "image/png")
                                       (uri . "file:///tmp/x.png"))))))
-      (should (equal rendered "\n\n![image](file:///tmp/x.png)\n\n")))))
+      (should (equal rendered "hello\n\n![image](file:///tmp/x.png)\n\n")))))
 
 (ert-deftest agent-shell--on-notification-session-info-update-test ()
   "Test `session_info_update' updates the session title.
@@ -848,6 +849,32 @@ _world_")
         (should prompt)
         (should (equal prompt '[((type . "text") (text . "Hello agent"))]))))))
 
+(ert-deftest agent-shell--send-command-strips-shell-maker-markers-test ()
+  "ACP prompts should be sanitized before they leave Emacs."
+  (let ((sent-request nil)
+        (agent-shell--state (list
+                             (cons :client 'test-client)
+                             (cons :session (list (cons :id "test-session") (cons :title nil)))
+                             (cons :prompt-capabilities '((:embedded-context . t)))
+                             (cons :buffer (current-buffer))
+                             (cons :last-entry-type nil)
+                             (cons :active-requests nil)
+                             (cons :idle-timer nil))))
+    (cl-letf (((symbol-function 'agent-shell--state)
+               (lambda () agent-shell--state))
+              ((symbol-function 'acp-send-request)
+               (lambda (&rest args)
+                 (setq sent-request args)))
+              ((symbol-function 'agent-shell-viewport--buffer)
+               (lambda (&rest _) nil)))
+      (agent-shell--send-command
+       :prompt "<shell-maker-failed-command>\nOpenClaw> hola<shell-maker-end-of-prompt>"
+       :shell-buffer nil)
+      (let* ((request (plist-get sent-request :request))
+             (params (map-elt request :params))
+             (prompt (map-elt params 'prompt)))
+        (should (equal prompt '[((type . "text") (text . "\nOpenClaw> hola"))]))))))
+
 (ert-deftest agent-shell--send-command-error-fallback-test ()
   "Test agent-shell--send-command falls back to plain text on build-content-blocks error."
   (let ((sent-request nil)
@@ -927,6 +954,7 @@ _world_")
        :shell-buffer (current-buffer))
       ;; Simulate the ACP response arriving
       (should captured-on-success)
+      (map-put! agent-shell--state :last-entry-type "agent_message_chunk")
       (funcall captured-on-success
                `((stopReason . "end_turn")
                  (usage . ((totalTokens . 1500)))))
@@ -935,6 +963,59 @@ _world_")
         (should (equal (map-elt data :stop-reason) "end_turn"))
         (should (equal (map-elt (map-elt data :usage) :total-tokens)
                        1500))))))
+
+(ert-deftest agent-shell--send-command-shows-empty-turn-notice-test ()
+  "A successful ACP turn with no visible updates should not look blank."
+  (let ((captured-on-success nil)
+        (empty-notice-called nil)
+        (agent-shell--state (list (cons :buffer (current-buffer))
+                                  (cons :event-subscriptions nil)
+                                  (cons :client 'test-client)
+                                  (cons :session (list (cons :id "test-session") (cons :title nil)))
+                                  (cons :last-entry-type nil)
+                                  (cons :tool-calls nil)
+                                  (cons :usage nil)
+                                  (cons :idle-timer nil)))
+        (agent-shell-show-busy-indicator nil)
+        (agent-shell-show-usage-at-turn-end nil))
+    (cl-letf (((symbol-function 'agent-shell--state)
+               (lambda () agent-shell--state))
+              ((symbol-function 'agent-shell--send-request)
+               (lambda (&rest args)
+                 (setq captured-on-success (plist-get args :on-success))))
+              ((symbol-function 'agent-shell--display-empty-turn-notice)
+               (lambda (state)
+                 (setq empty-notice-called t)
+                 (map-put! state :last-entry-type "empty_turn")))
+              ((symbol-function 'shell-maker-finish-output)
+               (lambda (&rest _)))
+              ((symbol-function 'agent-shell--process-pending-request)
+               (lambda (&rest _))))
+      (agent-shell--send-command
+       :prompt "Hello"
+       :shell-buffer (current-buffer))
+      (should captured-on-success)
+      (funcall captured-on-success '((stopReason . "end_turn")))
+      (should empty-notice-called)
+      (should (equal (map-elt agent-shell--state :last-entry-type)
+                     "empty_turn")))))
+
+(ert-deftest agent-shell--display-empty-turn-notice-test ()
+  "The empty-turn diagnostic renders a visible fragment and marks the state."
+  (let ((calls nil)
+        (state (list (cons :request-count 7)
+                     (cons :last-entry-type nil))))
+    (cl-letf (((symbol-function 'agent-shell--flush-transcript-for-boundary)
+               (lambda (&rest _)))
+              ((symbol-function 'agent-shell--update-fragment)
+               (lambda (&rest args)
+                 (push args calls))))
+      (agent-shell--display-empty-turn-notice state)
+      (should (equal (map-elt state :last-entry-type) "empty_turn"))
+      (let ((call (car calls)))
+        (should (equal (plist-get call :block-id) "7-empty-turn"))
+        (should (string-match-p "without sending any assistant text"
+                                (plist-get call :body)))))))
 
 (ert-deftest agent-shell--send-command-preserves-viewport-edit-draft-test ()
   "Sending a command must not disturb an in-progress viewport edit draft.
@@ -1796,6 +1877,446 @@ driven by a single helper on both paths."
              :file-path file)
             (should (= (file-attribute-size (file-attributes file))
                        size-before))))
+      (delete-file file))))
+
+(defun agent-shell-tests--file-string (file)
+  "Return FILE contents as a string."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (buffer-string)))
+
+(ert-deftest agent-shell--same-kind-late-agent-message-chunk-continues-open-group-test ()
+  "Same-kind no-active message chunk appends as a late open-group tail."
+  (let ((file (make-temp-file "agent-shell-transcript")))
+    (unwind-protect
+        (with-temp-buffer
+          (setq major-mode 'agent-shell-mode)
+          (setq-local comint-last-output-start (copy-marker (point-min)))
+          (let* ((agent-shell--transcript-file file)
+                 (state (agent-shell--make-state :buffer (current-buffer))))
+            (map-put! state :request-count 7)
+            (map-put! state :active-requests
+                      (list '((:method . "session/prompt"))))
+            (setq-local agent-shell--state state)
+            (cl-letf (((symbol-function 'agent-shell--ensure-transcript-file)
+                       (lambda () file))
+                      ((symbol-function 'agent-shell-viewport--buffer)
+                       (lambda (&rest _) nil)))
+              (agent-shell--on-notification
+               :state state
+               :acp-notification
+               (agent-shell-tests--make-session-update
+                "agent_message_chunk" "despi"))
+              (map-put! state :active-requests nil)
+              (agent-shell--separate-transcript-after-agent-message
+               :state state
+               :last-entry-type (map-elt state :last-entry-type)
+               :file-path file)
+              (agent-shell--on-notification
+               :state state
+               :acp-notification
+               (agent-shell-tests--make-session-update
+                "agent_message_chunk" "erto"))
+              (let ((shell-text (buffer-substring-no-properties
+                                 (point-min) (point-max)))
+                    (transcript (agent-shell-tests--file-string file)))
+                (should (string-match-p "despierto" shell-text))
+                (should-not (string-match-p "despi\n\nerto" shell-text))
+                (should (string-match-p "despierto" transcript))
+                (should-not (string-match-p "despi\n\nerto" transcript)))
+              (agent-shell--on-notification
+               :state state
+               :acp-notification
+               (agent-shell-tests--make-session-update
+                "agent_thought_chunk" "next"))
+              (should-not (map-elt state :agent-message-streaming-group))
+              (should (map-elt state :agent-thought-streaming-group))
+              (should (string-match-p
+                       "next"
+                       (buffer-substring-no-properties
+                        (point-min) (point-max))))
+              (should (string-match-p
+                       "## Agent's Thoughts"
+                       (agent-shell-tests--file-string file))))))
+      (delete-file file))))
+
+(ert-deftest agent-shell--agent-message-chunk-preserves-paragraph-newlines-test ()
+  "Intentional paragraph breaks in text chunks are preserved."
+  (let ((file (make-temp-file "agent-shell-transcript")))
+    (unwind-protect
+        (with-temp-buffer
+          (setq major-mode 'agent-shell-mode)
+          (setq-local comint-last-output-start (copy-marker (point-min)))
+          (let* ((agent-shell--transcript-file file)
+                 (state (agent-shell--make-state :buffer (current-buffer))))
+            (map-put! state :request-count 8)
+            (map-put! state :active-requests
+                      (list '((:method . "session/prompt"))))
+            (setq-local agent-shell--state state)
+            (cl-letf (((symbol-function 'agent-shell--ensure-transcript-file)
+                       (lambda () file))
+                      ((symbol-function 'agent-shell-viewport--buffer)
+                       (lambda (&rest _) nil)))
+              (agent-shell--on-notification
+               :state state
+               :acp-notification
+               (agent-shell-tests--make-session-update
+                "agent_message_chunk" "one\n\ntwo"))
+              (should (string-match-p
+                       "one\n\ntwo"
+                       (buffer-substring-no-properties
+                        (point-min) (point-max))))
+              (should (string-match-p
+                       "one\n\ntwo"
+                       (agent-shell-tests--file-string file))))))
+      (delete-file file))))
+
+(ert-deftest agent-shell--same-kind-late-agent-thought-chunk-continues-open-group-test ()
+  "Same-kind no-active thought chunk appends as a late open-group tail."
+  (let ((file (make-temp-file "agent-shell-transcript")))
+    (unwind-protect
+        (with-temp-buffer
+          (setq major-mode 'agent-shell-mode)
+          (setq-local comint-last-output-start (copy-marker (point-min)))
+          (let* ((agent-shell--transcript-file file)
+                 (state (agent-shell--make-state :buffer (current-buffer))))
+            (map-put! state :request-count 9)
+            (map-put! state :active-requests
+                      (list '((:method . "session/prompt"))))
+            (setq-local agent-shell--state state)
+            (cl-letf (((symbol-function 'agent-shell--ensure-transcript-file)
+                       (lambda () file))
+                      ((symbol-function 'agent-shell-viewport--buffer)
+                       (lambda (&rest _) nil)))
+              (agent-shell--on-notification
+               :state state
+               :acp-notification
+               (agent-shell-tests--make-session-update
+                "agent_thought_chunk" "still think"))
+              (map-put! state :active-requests nil)
+              (agent-shell--separate-transcript-after-agent-message
+               :state state
+               :last-entry-type (map-elt state :last-entry-type)
+               :file-path file)
+              (agent-shell--on-notification
+               :state state
+               :acp-notification
+               (agent-shell-tests--make-session-update
+                "agent_thought_chunk" "ing"))
+              (let ((shell-text (buffer-substring-no-properties
+                                 (point-min) (point-max)))
+                    (transcript (agent-shell-tests--file-string file)))
+                (should (string-match-p "still thinking" shell-text))
+                (should (string-match-p "still thinking" transcript))
+                (should-not (string-match-p "still think\n\ning" transcript))
+                (should-not (string-match-p "Out of turn - ACP server bug"
+                                            shell-text))
+                (should-not (string-match-p "Out of turn - ACP server bug"
+                                            transcript))))))
+      (delete-file file))))
+
+(ert-deftest agent-shell--same-kind-agent-message-chunk-without-open-group-renders-out-of-turn-test ()
+  "A fresh out-of-turn message is supported and starts a render group."
+  (let ((state (agent-shell--make-state))
+        captured)
+    (map-put! state :last-entry-type "agent_message_chunk")
+    (cl-letf (((symbol-function 'agent-shell--active-requests-p)
+               (lambda (_state) nil))
+              ((symbol-function 'agent-shell--append-transcript) #'ignore)
+              ((symbol-function 'agent-shell--update-fragment)
+               (lambda (&rest args) (setq captured args))))
+      (agent-shell--on-notification
+       :state state
+       :acp-notification
+       (agent-shell-tests--make-session-update
+        "agent_message_chunk" "background result")))
+    (should (equal (plist-get captured :namespace-id) "out-of-turn"))
+    (should (equal (plist-get captured :body) "background result"))
+    (should (map-elt state :agent-message-streaming-group))))
+
+(ert-deftest agent-shell--out-of-turn-kind-switch-starts-fresh-streaming-group-test ()
+  "Out-of-turn background thought traffic starts a distinct stream group."
+  (let ((state (agent-shell--make-state))
+        (active t)
+        captured)
+    (map-put! state :request-count 11)
+    (map-put! state :active-requests (list '((:method . "session/prompt"))))
+    (cl-letf (((symbol-function 'agent-shell--active-requests-p)
+               (lambda (_state) active))
+              ((symbol-function 'agent-shell--append-transcript) #'ignore)
+              ((symbol-function 'agent-shell--update-fragment)
+               (lambda (&rest args) (setq captured args)))
+              ((symbol-function 'agent-shell--refresh-activity-group-header) #'ignore))
+      (agent-shell--on-notification
+       :state state
+       :acp-notification
+       (agent-shell-tests--make-session-update "agent_message_chunk" "first"))
+      (should (map-elt state :agent-message-streaming-group))
+      (setq active nil)
+      (map-put! state :active-requests nil)
+      (agent-shell--on-notification
+       :state state
+       :acp-notification
+       (agent-shell-tests--make-session-update "agent_thought_chunk" "background thought")))
+    (should-not (map-elt state :agent-message-streaming-group))
+    (should (map-elt state :agent-thought-streaming-group))
+    (should (equal (plist-get captured :namespace-id) "out-of-turn"))
+    (should (equal (plist-get captured :body) "background thought"))))
+
+(ert-deftest agent-shell--error-diagnostic-is-streaming-boundary-test ()
+  "Request error diagnostics close stale streaming groups."
+  (let ((file (make-temp-file "agent-shell-transcript")))
+    (unwind-protect
+        (with-temp-buffer
+          (setq major-mode 'agent-shell-mode)
+          (setq-local comint-last-output-start (copy-marker (point-min)))
+          (let* ((agent-shell--transcript-file file)
+                 (state (agent-shell--make-state
+                         :agent-config '((:mode-line-name . "Test Agent"))
+                         :buffer (current-buffer))))
+            (map-put! state :request-count 12)
+            (map-put! state :active-requests
+                      (list '((:method . "session/prompt"))))
+            (setq-local agent-shell--state state)
+            (cl-letf (((symbol-function 'agent-shell--ensure-transcript-file)
+                       (lambda () file))
+                      ((symbol-function 'agent-shell-viewport--buffer)
+                       (lambda (&rest _) nil)))
+              ;; 1. In-turn assistant chunk opens a message streaming group.
+              (agent-shell--on-notification
+               :state state
+               :acp-notification
+               (agent-shell-tests--make-session-update
+                "agent_message_chunk" "first"))
+              (should (map-elt state :agent-message-streaming-group))
+
+              ;; 2. Request failure defers the transcript separator before the
+              ;; error diagnostic renders.
+              (map-put! state :active-requests nil)
+              (agent-shell--separate-transcript-after-agent-message
+               :state state
+               :last-entry-type (map-elt state :last-entry-type)
+               :file-path file)
+              (should (equal (map-elt state :pending-transcript-separator)
+                             "\n\n"))
+
+              ;; 3. Error rendering is a boundary: it flushes the separator,
+              ;; closes stale groups, and leaves a non-streaming marker.
+              (agent-shell--on-error
+               :state state
+               :acp-error '((message . "Request failed")))
+              (should-not (map-elt state :agent-message-streaming-group))
+              (should-not (map-elt state :agent-thought-streaming-group))
+              (should-not (map-elt state :pending-transcript-separator))
+              (should (equal (map-elt state :last-entry-type) "error"))
+
+              ;; 4. A later no-active message is supported as background
+              ;; output, but starts a fresh group after the error boundary.
+              (agent-shell--on-notification
+               :state state
+               :acp-notification
+               (agent-shell-tests--make-session-update
+                "agent_message_chunk" "STALE"))
+              (let ((shell-text (buffer-substring-no-properties
+                                 (point-min) (point-max)))
+                    (transcript (agent-shell-tests--file-string file)))
+                (should-not (string-match-p "firstSTALE" shell-text))
+                (should-not (string-match-p "firstSTALE" transcript))
+                (should (string-match-p "first\n\n" transcript))
+                (should (string-match-p "STALE" transcript)))
+              (should (map-elt state :agent-message-streaming-group))
+              (should-not (map-elt state :agent-thought-streaming-group))
+              (should (equal (map-elt state :last-entry-type)
+                             "agent_message_chunk")))))
+      (delete-file file))))
+
+(ert-deftest agent-shell--subscribed-error-is-streaming-boundary-test ()
+  "The subscribed ACP error callback closes stale streaming groups."
+  (let ((file (make-temp-file "agent-shell-transcript"))
+        on-error)
+    (unwind-protect
+        (with-temp-buffer
+          (setq major-mode 'agent-shell-mode)
+          (setq-local comint-last-output-start (copy-marker (point-min)))
+          (let* ((agent-shell--transcript-file file)
+                 (state (agent-shell--make-state
+                         :agent-config '((:mode-line-name . "Test Agent"))
+                         :buffer (current-buffer))))
+            (map-put! state :request-count 13)
+            (map-put! state :active-requests
+                      (list '((:method . "session/prompt"))))
+            (setq-local agent-shell--state state)
+            (cl-letf (((symbol-function 'agent-shell--ensure-transcript-file)
+                       (lambda () file))
+                      ((symbol-function 'agent-shell-viewport--buffer)
+                       (lambda (&rest _) nil))
+                      ((symbol-function 'shell-maker-busy)
+                       (lambda () nil))
+                      ((symbol-function 'acp-subscribe-to-errors)
+                       (lambda (&rest args)
+                         (setq on-error (plist-get args :on-error))))
+                      ((symbol-function 'acp-subscribe-to-notifications)
+                       #'ignore)
+                      ((symbol-function 'acp-subscribe-to-requests)
+                       #'ignore))
+              (agent-shell--subscribe-to-client-events :state state)
+              (should on-error)
+
+              ;; 1. In-turn assistant chunk opens a message streaming group.
+              (agent-shell--on-notification
+               :state state
+               :acp-notification
+               (agent-shell-tests--make-session-update
+                "agent_message_chunk" "first"))
+              (should (map-elt state :agent-message-streaming-group))
+
+              ;; 2. Request failure defers the transcript separator before the
+              ;; subscribed ACP error callback renders the notice.
+              (map-put! state :active-requests nil)
+              (agent-shell--separate-transcript-after-agent-message
+               :state state
+               :last-entry-type (map-elt state :last-entry-type)
+               :file-path file)
+              (should (equal (map-elt state :pending-transcript-separator)
+                             "\n\n"))
+
+              ;; 3. The actual subscribed error path is a boundary while
+              ;; preserving the Notices UI.
+              (funcall on-error '((message . "Request failed")))
+              (let ((shell-text (buffer-substring-no-properties
+                                 (point-min) (point-max)))
+                    (transcript (agent-shell-tests--file-string file)))
+                (should (string-match-p "Notices" shell-text))
+                (should (string-match-p "Request failed" shell-text))
+                (should (string-match-p "first\n\n" transcript)))
+              (should-not (map-elt state :agent-message-streaming-group))
+              (should-not (map-elt state :agent-thought-streaming-group))
+              (should-not (map-elt state :pending-transcript-separator))
+              (should (equal (map-elt state :last-entry-type) "error"))
+
+              ;; 4. Background output after the subscribed error starts a
+              ;; fresh stream instead of appending to the failed turn.
+              (agent-shell--on-notification
+               :state state
+               :acp-notification
+               (agent-shell-tests--make-session-update
+                "agent_message_chunk" "STALE"))
+              (let ((shell-text (buffer-substring-no-properties
+                                 (point-min) (point-max)))
+                    (transcript (agent-shell-tests--file-string file)))
+                (should-not (string-match-p "firstSTALE" shell-text))
+                (should-not (string-match-p "firstSTALE" transcript))
+                (should (string-match-p "STALE" transcript))
+                (should (string-match-p "first\n\n" transcript)))
+              (should (map-elt state :agent-message-streaming-group))
+              (should-not (map-elt state :agent-thought-streaming-group))
+              (should (equal (map-elt state :last-entry-type)
+                             "agent_message_chunk")))))
+      (delete-file file))))
+
+(ert-deftest agent-shell--streaming-kind-switch-starts-new-group-test ()
+  "Switching stream kinds must not append to a stale streaming group."
+  (let ((file (make-temp-file "agent-shell-transcript"))
+        calls)
+    (unwind-protect
+        (with-temp-buffer
+          (let* ((agent-shell--transcript-file file)
+                 (state (agent-shell--make-state :buffer (current-buffer))))
+            (map-put! state :request-count 10)
+            (map-put! state :active-requests
+                      (list '((:method . "session/prompt"))))
+            (cl-letf (((symbol-function 'agent-shell--ensure-transcript-file)
+                       (lambda () file))
+                      ((symbol-function 'agent-shell--update-fragment)
+                       (lambda (&rest args)
+                         (push args calls))))
+              (agent-shell--on-agent-streaming-chunk
+               state
+               (agent-shell-tests--make-session-update
+                "agent_message_chunk" "first"))
+              (should (map-elt state :agent-message-streaming-group))
+              (should-not (map-elt state :agent-thought-streaming-group))
+
+              (agent-shell--on-agent-streaming-chunk
+               state
+               (agent-shell-tests--make-session-update
+                "agent_thought_chunk" "think"))
+              (should-not (map-elt state :agent-message-streaming-group))
+              (should (map-elt state :agent-thought-streaming-group))
+
+              (agent-shell--on-agent-streaming-chunk
+               state
+               (agent-shell-tests--make-session-update
+                "agent_message_chunk" "second"))
+              (should (map-elt state :agent-message-streaming-group))
+              (should-not (map-elt state :agent-thought-streaming-group))
+
+              (let ((ordered-calls (nreverse calls)))
+                (should (equal (mapcar (lambda (args)
+                                          (plist-get args :block-id))
+                                        ordered-calls)
+                               '("1-agent_message_chunk"
+                                 "2-agent_thought_chunk"
+                                 "3-agent_message_chunk")))
+                (should (equal (mapcar (lambda (args)
+                                          (plist-get args :create-new))
+                                        ordered-calls)
+                               '(t t t)))
+                (should (equal (mapcar (lambda (args)
+                                          (plist-get args :append))
+                                        ordered-calls)
+                               '(nil nil nil)))))))
+      (delete-file file))))
+
+(ert-deftest agent-shell--streaming-chunks-rerender-accumulated-body-test ()
+  "Continuation chunks replace the block with accumulated content.
+
+This keeps renderers that finalize paragraphs per call from preserving
+chunk-boundary whitespace in the live buffer."
+  (let ((file (make-temp-file "agent-shell-transcript"))
+        calls)
+    (unwind-protect
+        (with-temp-buffer
+          (let* ((agent-shell--transcript-file file)
+                 (state (agent-shell--make-state :buffer (current-buffer))))
+            (map-put! state :request-count 14)
+            (map-put! state :active-requests
+                      (list '((:method . "session/prompt"))))
+            (cl-letf (((symbol-function 'agent-shell--ensure-transcript-file)
+                       (lambda () file))
+                      ((symbol-function 'agent-shell--update-fragment)
+                       (lambda (&rest args)
+                         (push args calls))))
+              (dolist (chunk '("Aquí"
+                               " estamos, en pie"
+                               " y con los ventiladores tranqu"
+                               "ilos. ¿"
+                               "Qué movemos"
+                               " hoy, Is"
+                               "ma?"))
+                (agent-shell--on-agent-streaming-chunk
+                 state
+                 (agent-shell-tests--make-session-update
+                  "agent_message_chunk" chunk)))
+              (let ((ordered-calls (nreverse calls)))
+                (should (equal (mapcar (lambda (args)
+                                          (plist-get args :body))
+                                        ordered-calls)
+                               '("Aquí"
+                                 "Aquí estamos, en pie"
+                                 "Aquí estamos, en pie y con los ventiladores tranqu"
+                                 "Aquí estamos, en pie y con los ventiladores tranquilos. ¿"
+                                 "Aquí estamos, en pie y con los ventiladores tranquilos. ¿Qué movemos"
+                                 "Aquí estamos, en pie y con los ventiladores tranquilos. ¿Qué movemos hoy, Is"
+                                 "Aquí estamos, en pie y con los ventiladores tranquilos. ¿Qué movemos hoy, Isma?")))
+                (should (equal (mapcar (lambda (args)
+                                          (plist-get args :create-new))
+                                        ordered-calls)
+                               '(t nil nil nil nil nil nil)))
+                (should (equal (mapcar (lambda (args)
+                                          (plist-get args :append))
+                                        ordered-calls)
+                               '(nil nil nil nil nil nil nil)))))))
       (delete-file file))))
 
 (ert-deftest agent-shell-mcp-servers-test ()
@@ -3926,6 +4447,45 @@ nothing depending on selection direction."
           (reversed (agent-shell--filter-buffer-substring (point-max) (point-min))))
       (should (equal forward "hello world"))
       (should (equal reversed forward)))))
+(ert-deftest agent-shell-filter-buffer-substring-strips-shell-maker-markers ()
+  "Copying shell text should exclude internal shell-maker delimiters."
+  (with-temp-buffer
+    (insert (propertize "\n<shell-maker-failed-command>\n"
+                        'invisible t))
+    (insert "OpenClaw> Como van los maquinas?")
+    (insert (propertize "<shell-maker-end-of-prompt>"
+                        'shell-maker--marker t
+                        'invisible t))
+    (insert "\nVan bien.\n")
+    (insert "literal <shell-maker-interrupted-command> marker\n")
+    (let ((result (agent-shell--filter-buffer-substring (point-min) (point-max))))
+      (should-not (string-match-p "shell-maker" result))
+      (should (equal result "OpenClaw> Como van los maquinas?\nVan bien.\nliteral  marker\n")))))
+
+(ert-deftest agent-shell-strip-shell-maker-markers-test ()
+  "Outgoing prompts should never include internal shell-maker delimiters."
+  (should (equal (agent-shell--strip-shell-maker-markers
+                  "<shell-maker-failed-command>\nOpenClaw> hola<shell-maker-end-of-prompt>")
+                 "\nOpenClaw> hola"))
+  (should (equal (agent-shell--strip-shell-maker-markers
+                  "ok<shell-maker-interrupted-command>")
+                 "ok")))
+
+(ert-deftest agent-shell-get-region-strips-shell-maker-markers-test ()
+  "Region/current-line context should exclude hidden shell-maker markers."
+  (with-temp-buffer
+    (insert (propertize "<shell-maker-failed-command>"
+                        'shell-maker--marker t
+                        'invisible t))
+    (insert "visible")
+    (insert (propertize "<shell-maker-end-of-prompt>"
+                        'shell-maker--marker t
+                        'invisible t))
+    (set-mark (point-min))
+    (goto-char (point-max))
+    (activate-mark)
+    (let ((context (agent-shell--get-region-context :deactivate t :no-error t)))
+      (should (equal context "visible")))))
 
 (ert-deftest agent-shell-trim-strips-untagged-whitespace ()
   ;; Plain `string-trim'-style behavior when nothing is tagged: outer
@@ -4633,6 +5193,76 @@ think-kind calls into Thinking."
                     :state state
                     :acp-notification '((some-key . "some-value")))
                   '((adapted . t) (some-key . "some-value"))))))
+(ert-deftest agent-shell--session-list-cwd-defaults-to-current-directory-test ()
+  "Test session/list keeps cwd filtering by default."
+  (with-temp-buffer
+    (let ((state (list (cons :agent-config
+                             (agent-shell-make-agent-config
+                              :identifier 'test-agent)))))
+      (setq-local agent-shell--state state)
+      (cl-letf (((symbol-function 'agent-shell--state)
+                 (lambda () agent-shell--state))
+                ((symbol-function 'agent-shell-cwd)
+                 (lambda () "/tmp/project"))
+                ((symbol-function 'agent-shell--resolve-path)
+                 (lambda (path) path)))
+        (let* ((request (agent-shell--make-session-list-request
+                         (agent-shell--session-list-cwd)))
+               (params (map-elt request :params)))
+          (should (equal (map-elt params 'cwd) "/tmp/project")))))))
+
+(ert-deftest agent-shell--session-list-can-disable-cwd-filter-test ()
+  "Test agent configs can request unfiltered session/list."
+  (with-temp-buffer
+    (let ((state (list (cons :agent-config
+                             (agent-shell-make-agent-config
+                              :identifier 'test-agent
+                              :session-list-filter-by-cwd nil)))))
+      (setq-local agent-shell--state state)
+      (cl-letf (((symbol-function 'agent-shell--state)
+                 (lambda () agent-shell--state))
+                ((symbol-function 'agent-shell-cwd)
+                 (lambda () (error "cwd should not be read")))
+                ((symbol-function 'agent-shell--resolve-path)
+                 (lambda (_path) (error "cwd should not be resolved"))))
+        (let ((request (agent-shell--make-session-list-request
+                        (agent-shell--session-list-cwd))))
+          (should (equal (map-elt request :method) "session/list"))
+          (should (hash-table-p (map-elt request :params)))
+          (should (zerop (hash-table-count (map-elt request :params)))))))))
+
+(ert-deftest agent-shell--session-list-filter-function-test ()
+  "Test agent configs can filter session/list rows after retrieval."
+  (with-temp-buffer
+    (let ((agent-shell--state
+           (list (cons :agent-config
+                       (agent-shell-make-agent-config
+                        :identifier 'test-agent
+                        :session-list-filter-function
+                        (lambda (session)
+                          (string-prefix-p "project:"
+                                           (map-elt session 'sessionId))))))))
+      (setq-local agent-shell--state agent-shell--state)
+      (cl-letf (((symbol-function 'agent-shell--state)
+                 (lambda () agent-shell--state)))
+        (should
+         (equal (agent-shell--filter-sessions
+                 '(((sessionId . "other:1"))
+                   ((sessionId . "project:1"))
+                   ((sessionId . "project:2"))))
+                '(((sessionId . "project:1"))
+                  ((sessionId . "project:2")))))))))
+
+(ert-deftest agent-shell-make-agent-config-keeps-session-hooks-test ()
+  "Test session filtering and request decoration are retained in configs."
+  (let* ((predicate (lambda (_session) t))
+         (decorator (lambda (request) request))
+         (config (agent-shell-make-agent-config
+                  :identifier 'test-agent
+                  :session-list-filter-function predicate
+                  :outgoing-request-decorator decorator)))
+    (should (eq (map-elt config :session-list-filter-function) predicate))
+    (should (eq (map-elt config :outgoing-request-decorator) decorator))))
 
 (provide 'agent-shell-tests)
 ;;; agent-shell-tests.el ends here

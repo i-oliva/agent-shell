@@ -7,7 +7,8 @@
 ;; Version: 0.63.4
 ;; Package-Requires: ((emacs "29.1") (shell-maker "0.93.5") (acp "0.13.1"))
 
-(defconst agent-shell--version "0.63.4")
+(defconst agent-shell--version "0.63.4-openclaw-push-ack.1"
+  "Version advertised in ACP clientInfo, including custom push ACK semantics.")
 
 ;; This package is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -77,6 +78,7 @@
 (require 'agent-shell-mistral)
 (require 'agent-shell-omp)
 (require 'agent-shell-openai)
+(require 'agent-shell-openclaw)
 (require 'agent-shell-opencode)
 (require 'agent-shell-pi)
 (require 'agent-shell-project)
@@ -580,6 +582,10 @@ Each element can be:
                                               session-meta
                                               mcp-servers
                                               notification-adapter
+                                              session-mode-config-category
+                                              (session-list-filter-by-cwd t)
+                                              session-list-filter-function
+                                              outgoing-request-decorator
                                               icon-name
                                               install-instructions)
   "Create an agent configuration alist.
@@ -603,6 +609,10 @@ Keyword arguments:
   precedence over the global `agent-shell-mcp-servers'.  Same shape as
   that variable.
 - NOTIFICATION-ADAPTER: Optional function to modify/normalize `notification'
+- SESSION-MODE-CONFIG-CATEGORY: Config option category backing session modes.
+- SESSION-LIST-FILTER-BY-CWD: Non-nil to pass cwd to session/list.
+- SESSION-LIST-FILTER-FUNCTION: Optional predicate applied to listed sessions.
+- OUTGOING-REQUEST-DECORATOR: Optional function applied to ACP requests.
 - ICON-NAME: Name of the icon to use
 - INSTALL-INSTRUCTIONS: Instructions to show when executable is not found
 
@@ -621,6 +631,10 @@ Returns an alist with all specified values."
     (:session-meta . ,session-meta)
     (:mcp-servers . ,mcp-servers)
     (:notification-adapter . ,notification-adapter)            ;; function
+    (:session-mode-config-category . ,session-mode-config-category)
+    (:session-list-filter-by-cwd . ,session-list-filter-by-cwd)
+    (:session-list-filter-function . ,session-list-filter-function)
+    (:outgoing-request-decorator . ,outgoing-request-decorator)
     (:icon-name . ,icon-name)
     (:install-instructions . ,install-instructions)))
 
@@ -646,6 +660,7 @@ reloads.  See `agent-shell-agent-configs'."
         #'agent-shell-kiro-make-config
         #'agent-shell-mistral-make-config
         #'agent-shell-omp-make-agent-config
+        #'agent-shell-openclaw-make-agent-config
         #'agent-shell-opencode-make-agent-config
         #'agent-shell-pi-make-agent-config
         #'agent-shell-qwen-make-agent-config
@@ -709,6 +724,7 @@ behavior explicitly."
                  (const :tag "Kimi" kimi)
                  (const :tag "Kiro" kiro)
                  (const :tag "Mistral" le-chat)
+                 (const :tag "OpenClaw" openclaw)
                  (const :tag "OpenCode" opencode)
                  (const :tag "Pi" pi)
                  (const :tag "Qwen Code" qwen-code)
@@ -1040,6 +1056,9 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
         (cons :chunked-group-count 0)
         (cons :activity-group-count 0)
         (cons :activity-thoughts nil)
+        (cons :agent-message-streaming-group nil)
+        (cons :agent-thought-streaming-group nil)
+        (cons :pending-transcript-separator nil)
         (cons :request-count 0)
         (cons :last-activity-time nil)
         (cons :tool-calls nil)
@@ -1787,13 +1806,16 @@ Returns one of:
   `blocked' - Agent is waiting for a permission response.
   `ready'   - Agent is idle and ready for input."
   (with-current-buffer (or shell-buffer (current-buffer))
-    (cond
-     ((and (shell-maker-busy)
-           (agent-shell--permission-pending-p)) 'blocked)
-     (t
-      (if (shell-maker-busy)
-          'busy
-        'ready)))))
+    (let ((busy (or (shell-maker-busy)
+                    (agent-shell-experimental--session-push-active-p
+                     (agent-shell--state)))))
+      (cond
+       ((and busy
+             (agent-shell--permission-pending-p)) 'blocked)
+       (t
+        (if busy
+            'busy
+          'ready))))))
 
 (defun agent-shell-interrupt (&optional force)
   "Interrupt in-progress request and reject all pending permissions.
@@ -1838,32 +1860,48 @@ See also `agent-shell-confirm-interrupt'."
       :command command
       :shell-buffer (map-elt shell :buffer)))))
 
+(defconst agent-shell--shell-maker-marker-regexp
+  (regexp-opt '("<shell-maker-end-of-prompt>"
+                "<shell-maker-failed-command>"
+                "<shell-maker-interrupted-command>")))
+
+(defun agent-shell--strip-shell-maker-markers (text)
+  "Return TEXT without internal `shell-maker' delimiter markers.
+
+These markers are implementation details inserted into shell buffers to
+separate prompts, responses, failed commands, and interrupted commands.  They
+should never be sent to agents or copied as user-visible text."
+  (replace-regexp-in-string agent-shell--shell-maker-marker-regexp "" text t t))
+
 (defun agent-shell--filter-buffer-substring (start end &optional delete)
   "Return visible text between START and END, stripping hidden markup.
 If DELETE is non-nil, delete the text between START and END.
 
-START and END may be given in either order: like the stock
-`buffer-substring', a reversed range (START > END, e.g. a
-right-to-left mouse selection or a kill where mark > point) is
-normalized.  Without this, the loop below would never run and the
-function would return the empty string, silently breaking mouse
-copy depending on selection direction."
+START and END may be given in either order; a reversed range is normalized."
   (let* ((beg (min start end))
          (fin (max start end))
          (text "")
          (pos beg))
     (while (< pos fin)
-      (let ((next (next-overlay-change pos))
-            (exclude (seq-find (lambda (ov)
-                                 (memq (overlay-get ov 'markdown-overlays-markup-type)
-                                       '(fence language inline-code
-                                               bold italic strikethrough header)))
-                               (overlays-at pos))))
+      (let* ((next (seq-min
+                    (delq nil
+                          (list (next-overlay-change pos)
+                                (next-single-property-change pos 'invisible nil fin)
+                                (next-single-property-change pos 'shell-maker--marker nil fin)
+                                fin))))
+             (exclude (or (get-text-property pos 'invisible)
+                          (get-text-property pos 'shell-maker--marker)
+                          (seq-find (lambda (ov)
+                                      (memq (overlay-get ov 'markdown-overlays-markup-type)
+                                            '(fence language inline-code
+                                                    bold italic strikethrough header)))
+                                    (overlays-at pos)))))
         (unless exclude
           (setq text (concat text (buffer-substring pos (min next fin)))))
         (setq pos (max next (1+ pos)))))
     (when delete
       (delete-region beg fin))
+    (setq text (agent-shell--strip-shell-maker-markers text))
     (remove-text-properties 0 (length text)
                             '(line-prefix nil wrap-prefix nil)
                             text)
@@ -1971,7 +2009,7 @@ Flow:
                                  ;; them in place instead of inserting past the prompt.
                                  (agent-shell--create-bootstrapping-placeholders (agent-shell--state))
                                  (shell-maker-finish-output :config shell-maker--config
-                                                            :success nil)
+                                                            :success t)
                                  (agent-shell--emit-event :event 'prompt-ready))
                                (agent-shell--handle :command command :shell-buffer shell-buffer))))
           ;; Send ACP request to set default model (optional)
@@ -2005,12 +2043,31 @@ Flow:
 
 (cl-defun agent-shell--on-error (&key state acp-error)
   "Handle ACP-ERROR with SHELL an STATE."
+  (agent-shell--flush-transcript-for-boundary state)
   (agent-shell--update-fragment
    :state state
    :block-id "Error"
    :body (or (map-elt acp-error 'message) "Some error ¯\\_ (ツ)_/¯")
    :create-new t
-   :navigation 'never))
+   :navigation 'never)
+  (map-put! state :last-entry-type "error"))
+
+(defun agent-shell--display-empty-turn-notice (state)
+  "Render a diagnostic when an ACP turn completes without visible output.
+
+Some servers can fail internally but still resolve `session/prompt' as
+`end_turn' without sending an assistant, tool, plan, or error update.  A
+visible diagnostic is better than leaving the user at a blank prompt."
+  (agent-shell--flush-transcript-for-boundary state)
+  (agent-shell--update-fragment
+   :state state
+   :block-id (format "%s-empty-turn" (or (map-elt state :request-count) 0))
+   :label-left (propertize "No assistant output"
+                           'font-lock-face 'font-lock-doc-markup-face)
+   :body "The ACP server completed this turn without sending any assistant text, tool call, plan, or error update. Check the backend logs for the real failure.\n\n"
+   :create-new t
+   :navigation 'never)
+  (map-put! state :last-entry-type "empty_turn"))
 
 (defun agent-shell-get-config (buffer)
   "Get the agent configuration for BUFFER.
@@ -2046,6 +2103,115 @@ COMMAND, when present, may be a shell command string or an argv vector."
 (defun agent-shell--active-requests-p (state)
   "Return non-nil if STATE has in-flight requests awaiting responses."
   (map-elt state :active-requests))
+
+(defun agent-shell--session-bound-notification-p (acp-notification)
+  "Return non-nil if ACP-NOTIFICATION reports session request progress.
+
+These notifications must arrive while an agent request is in
+flight (`session/prompt', `session/load', or `session/push').
+A server emitting one with no request active is non-conformant."
+  (and (equal (map-elt acp-notification 'method) "session/update")
+       (member (map-nested-elt acp-notification '(params update sessionUpdate))
+               '("tool_call" "tool_call_update"
+                 "agent_thought_chunk" "agent_message_chunk"
+                 "user_message_chunk" "plan"))))
+
+(defun agent-shell--streaming-group-state-key (update-type)
+  "Return STATE key for streaming UPDATE-TYPE."
+  (pcase update-type
+    ("agent_message_chunk" :agent-message-streaming-group)
+    ("agent_thought_chunk" :agent-thought-streaming-group)))
+
+(defun agent-shell--streaming-chunk-p (update-type)
+  "Return non-nil if UPDATE-TYPE is an agent streaming chunk."
+  (member update-type '("agent_message_chunk" "agent_thought_chunk")))
+
+(defun agent-shell--continue-streaming-group-p (state update-type)
+  "Return non-nil if UPDATE-TYPE continues STATE's open streaming group.
+
+ACP streaming chunks do not carry request or chunk ids, so after
+request completion there is no strict way to distinguish a final
+same-kind tail from a fresh out-of-turn chunk.  agent-shell accepts
+the chunk only when the previous rendered entry has the same
+UPDATE-TYPE and that stream kind still has an open group."
+  (and (equal (map-elt state :last-entry-type) update-type)
+       (map-elt state (agent-shell--streaming-group-state-key update-type))))
+
+(defun agent-shell--render-streaming-chunk-p (state update-type)
+  "Return non-nil if UPDATE-TYPE should render as a streaming chunk.
+
+While an ACP request is active, agent message/thought chunks are
+normal in-turn updates.  With no active request, same-kind chunks
+are treated as late tails only if an open streaming group exists;
+real boundaries reset groups, and fresh no-open/no-active chunks
+remain protocol bugs.  Do not infer freshness with timers or
+speculative ids that ACP does not provide."
+  (and (agent-shell--streaming-chunk-p update-type)
+       (or (agent-shell--active-requests-p state)
+           (agent-shell--continue-streaming-group-p state update-type))))
+
+(defun agent-shell--ensure-state-key (state key &optional value)
+  "Ensure STATE has KEY, initialized to VALUE when missing."
+  (unless (assq key state)
+    (nconc state (list (cons key value)))))
+
+(defun agent-shell--reset-streaming-groups (state)
+  "Close open agent message/thought streaming groups in STATE."
+  (agent-shell--ensure-state-key state :agent-message-streaming-group)
+  (agent-shell--ensure-state-key state :agent-thought-streaming-group)
+  (map-put! state :agent-message-streaming-group nil)
+  (map-put! state :agent-thought-streaming-group nil))
+
+(defun agent-shell--ensure-streaming-group (state update-type)
+  "Return streaming group info for UPDATE-TYPE in STATE.
+
+The returned alist has `:group' and `:new-group-p'.  A group's
+namespace, block id, and prompt-placement choice are captured when
+the group opens and reused only while the previous rendered entry
+has the same streaming update type.  This keeps final chunks that
+arrive just after request completion attached to the same displayed
+block without appending across stream-kind changes or boundaries.
+Those boundaries call `agent-shell--reset-streaming-groups', so a
+subsequent no-active chunk cannot be mistaken for a tail."
+  (let ((state-key (agent-shell--streaming-group-state-key update-type))
+        (opposite-state-key
+         (agent-shell--streaming-group-state-key
+          (pcase update-type
+            ("agent_message_chunk" "agent_thought_chunk")
+            ("agent_thought_chunk" "agent_message_chunk"))))
+        (new-group-p nil))
+    (unless state-key
+      (error "Unsupported streaming update type: %s" update-type))
+    (agent-shell--ensure-state-key state state-key)
+    (agent-shell--ensure-state-key state opposite-state-key)
+    (agent-shell--ensure-state-key state :chunked-group-count 0)
+    (unless (and (map-elt state state-key)
+                 (equal (map-elt state :last-entry-type) update-type))
+      (setq new-group-p t)
+      (map-put! state opposite-state-key nil)
+      (map-put! state :chunked-group-count
+                (1+ (or (map-elt state :chunked-group-count) 0)))
+      (map-put! state state-key
+                (list (cons :namespace-id
+                            (if (agent-shell--active-requests-p state)
+                                (or (map-elt state :request-count) 0)
+                              "out-of-turn"))
+                      (cons :block-id
+                            (format "%s-%s"
+                                    (map-elt state :chunked-group-count)
+                                    update-type))
+                      (cons :body "")
+                      (cons :above-last-prompt
+                            (not (agent-shell--active-requests-p state))))))
+    (list (cons :group (map-elt state state-key))
+          (cons :new-group-p new-group-p))))
+
+(defun agent-shell--flush-transcript-for-boundary (state)
+  "Flush a deferred transcript separator before a real boundary in STATE."
+  (agent-shell--flush-pending-transcript-separator
+   :state state
+   :file-path agent-shell--transcript-file)
+  (agent-shell--reset-streaming-groups state))
 
 (defun agent-shell--make-out-of-session-turn-notification-body (state acp-notification)
   "Build a fragment body for ACP-NOTIFICATION arriving out of turn using STATE."
@@ -2094,6 +2260,63 @@ Includes pretty-printed JSON and a `file a feature request' link."
             (json-pretty-print (point-min) (point-max))
             (buffer-string))))
 
+(defun agent-shell--on-agent-streaming-chunk (state acp-notification)
+  "Render an agent message/thought chunk ACP-NOTIFICATION using STATE."
+  (let* ((update-type (map-nested-elt acp-notification
+                                      '(params update sessionUpdate)))
+         (group-info (agent-shell--ensure-streaming-group state update-type))
+         (group (map-elt group-info :group))
+         (new-group-p (map-elt group-info :new-group-p))
+         (content (agent-shell--content-block-to-markdown
+                   (map-nested-elt acp-notification
+                                   '(params update content))))
+         (body (concat (or (map-elt group :body) "") content)))
+    (map-put! group :body body)
+    (when new-group-p
+      (agent-shell--flush-pending-transcript-separator
+       :state state
+       :file-path agent-shell--transcript-file)
+      (agent-shell--append-transcript
+       :text (pcase update-type
+               ("agent_message_chunk"
+                (format "\n## Agent (%s)\n\n" (format-time-string "%F %T")))
+               ("agent_thought_chunk"
+                (format "## Agent's Thoughts (%s)\n\n" (format-time-string "%F %T"))))
+       :file-path agent-shell--transcript-file))
+    ;; Indent markdown headers in LLM output so they nest below
+    ;; transcript section headers.  Applied per chunk: if a header is
+    ;; split across chunks it may not be indented (graceful degradation).
+    (agent-shell--append-transcript
+     :text (agent-shell--indent-markdown-headers content)
+     :file-path agent-shell--transcript-file)
+    (pcase update-type
+      ("agent_message_chunk"
+       (agent-shell--update-fragment
+        :state state
+        :namespace-id (map-elt group :namespace-id)
+        :block-id (map-elt group :block-id)
+        :body body
+        :create-new new-group-p
+        :append nil
+        :navigation 'never
+        :render-body-images t
+        :above-last-prompt (map-elt group :above-last-prompt)))
+      ("agent_thought_chunk"
+       (agent-shell--update-fragment
+        :state state
+        :namespace-id (map-elt group :namespace-id)
+        :block-id (map-elt group :block-id)
+        :label-left  (concat
+                      agent-shell-thought-process-icon
+                      " "
+                      (propertize "Thinking" 'font-lock-face 'font-lock-doc-markup-face))
+        :body body
+        :create-new new-group-p
+        :append nil
+        :expanded agent-shell-thought-process-expand-by-default
+        :render-body-images t
+        :above-last-prompt (map-elt group :above-last-prompt))))
+    (map-put! state :last-entry-type update-type)))
 (cl-defun agent-shell--adapt-notification (&key state acp-notification)
   "Return ACP-NOTIFICATION after optional agent-specific adaptation.
 
@@ -2498,52 +2721,47 @@ No-op while that function has nothing to summarize (an empty group)."
           ((map-elt state :pending-restore)
            (agent-shell--append-restore-notification state acp-notification))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "agent_message_chunk")
-           ;; Decide message boundaries by ACP's `messageId' when present:
-           ;; distinct messages must never coalesce, even if an interleaved
-           ;; entry (e.g. a tool call) failed to advance `:last-entry-type'
-           ;; and left it looking like a continuation.  `messageId' is
-           ;; optional (older agents omit it), so fall back to the turn
-           ;; boundary heuristic: a new run whenever the previous rendered
-           ;; entry was not itself a message chunk.
+           ;; Use messageId when available to keep distinct messages apart.
+           (agent-shell--ensure-state-key state :agent-message-streaming-group)
+           (agent-shell--ensure-state-key state :agent-thought-streaming-group)
+           ;; Keep the accumulated body in state so renderers that recompute
+           ;; a whole block (for example math/image renderers) receive the
+           ;; complete streamed message on every update.
            (let* ((message-id (map-nested-elt acp-notification '(params update messageId)))
                   (new-message (if message-id
                                    (not (equal message-id (map-elt state :last-agent-message-id)))
                                  (not (equal (map-elt state :last-entry-type) "agent_message_chunk"))))
                   (content (agent-shell--content-block-to-markdown
-                            (map-nested-elt acp-notification '(params update content)))))
+                            (map-nested-elt acp-notification '(params update content))))
+                  (group (unless new-message
+                           (map-elt state :agent-message-streaming-group)))
+                  (body (concat (or (map-elt group :body) "") content)))
+             (map-put! state :agent-message-streaming-group
+                       (list (cons :body body)))
+             (map-put! state :agent-thought-streaming-group nil)
              (when new-message
                (map-put! state :chunked-group-count (1+ (map-elt state :chunked-group-count)))
                (agent-shell--append-transcript
                 :text (format "\n## Agent (%s)\n\n" (format-time-string "%F %T"))
                 :file-path agent-shell--transcript-file))
-             ;; Indent markdown headers in LLM output so they nest
-             ;; below the transcript's ## section headers.  Applied
-             ;; per-chunk: if a header is split across chunks it may
-             ;; not be indented (graceful degradation).
              (agent-shell--append-transcript
               :text (agent-shell--indent-markdown-headers content)
               :file-path agent-shell--transcript-file)
              (agent-shell--update-fragment
               :state state
-              ;; Out of turn, key under a dedicated namespace so the
-              ;; message forms its own fragment rather than coalescing
-              ;; into the previous turn's final message.
               :namespace-id (unless (agent-shell--active-requests-p state) "out-of-turn")
-              ;; Key on `messageId' when present so distinct messages stay
-              ;; distinct; otherwise fall back to the per-run group count.
               :block-id (format "%s-agent_message_chunk"
                                 (or message-id (map-elt state :chunked-group-count)))
-              :body content
+              :body body
               :create-new new-message
-              :append t
+              :append nil
               :navigation 'never
               :render-body-images t
-              ;; Out of turn (no prompt request in flight) lands the
-              ;; message above the fresh prompt rather than after it.
               :above-last-prompt (not (agent-shell--active-requests-p state)))
              (map-put! state :last-agent-message-id message-id))
            (map-put! state :last-entry-type "agent_message_chunk"))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "tool_call")
+           (agent-shell--flush-transcript-for-boundary state)
            (agent-shell--save-tool-call
             state
             (map-nested-elt acp-notification '(params update toolCallId))
@@ -2596,16 +2814,19 @@ No-op while that function has nothing to summarize (an empty group)."
                 :above-last-prompt (not (agent-shell--active-requests-p state)))))
            (map-put! state :last-entry-type "tool_call"))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "agent_thought_chunk")
-           (let ((new-thought-p (not (equal (map-elt state :last-entry-type)
+           (agent-shell--ensure-state-key state :agent-message-streaming-group)
+           (agent-shell--ensure-state-key state :agent-thought-streaming-group)
+           (let* ((new-thought-p (not (equal (map-elt state :last-entry-type)
                                             "agent_thought_chunk")))
-                 (content (agent-shell--content-block-to-markdown
-                           (map-nested-elt acp-notification '(params update content))))
-                 ;; Share the tool-call run counter so a thought lands in
-                 ;; the same activity group as the surrounding tool calls.
-                 ;; Read before `:last-entry-type' is advanced below;
-                 ;; stable across a thought's streamed chunks since
-                 ;; "agent_thought_chunk" keeps the run open.
-                 (group-id (agent-shell--activity-group-current-id state)))
+                  (content (agent-shell--content-block-to-markdown
+                            (map-nested-elt acp-notification '(params update content))))
+                  (group-id (agent-shell--activity-group-current-id state))
+                  (stream-group (unless new-thought-p
+                                  (map-elt state :agent-thought-streaming-group)))
+                  (body (concat (or (map-elt stream-group :body) "") content)))
+             (map-put! state :agent-thought-streaming-group
+                       (list (cons :body body)))
+             (map-put! state :agent-message-streaming-group nil)
              (when new-thought-p
                (map-put! state :chunked-group-count (1+ (map-elt state :chunked-group-count)))
                (agent-shell--append-transcript
@@ -2616,34 +2837,22 @@ No-op while that function has nothing to summarize (an empty group)."
               :file-path agent-shell--transcript-file)
              (agent-shell--update-fragment
               :state state
-              ;; Out of turn, key under a dedicated namespace so the
-              ;; thought forms its own fragment rather than coalescing
-              ;; into the previous turn's final thought (same request-count
-              ;; and group-count).  ACP's ContentChunk.messageId is the
-              ;; spec's intended discriminator here, but it is optional and
-              ;; only populated by newer agents, so we group by turn
-              ;; boundary instead.
               :namespace-id (unless (agent-shell--active-requests-p state) "out-of-turn")
               :block-id (format "%s-agent_thought_chunk"
                                 (map-elt state :chunked-group-count))
-              :label-left  (concat
-                            (when (and agent-shell-thought-process-icon
-                                       (not (string-empty-p agent-shell-thought-process-icon)))
-                              (concat agent-shell-thought-process-icon " "))
-                            (propertize "Thinking" 'font-lock-face 'agent-shell-section-heading))
-              :body content
-              :append (equal (map-elt state :last-entry-type)
-                             "agent_thought_chunk")
+              :label-left (concat
+                           (when (and agent-shell-thought-process-icon
+                                      (not (string-empty-p agent-shell-thought-process-icon)))
+                             (concat agent-shell-thought-process-icon " "))
+                           (propertize "Thinking" 'font-lock-face 'agent-shell-section-heading))
+              :body body
+              :append nil
               :expanded agent-shell-thought-process-expand-by-default
               :group-id group-id
               :group-label agent-shell--activity-group-label
               :group-expanded agent-shell-activity-group-expand-by-default
               :render-body-images t
               :above-last-prompt (not (agent-shell--active-requests-p state)))
-             ;; Count this thought (once per thought run, not per streamed
-             ;; chunk) and relabel the header so a thought-only group reads
-             ;; "Thinking"/"Thought" instead of the neutral placeholder, and
-             ;; a mixed group can mention it.
              (when new-thought-p
                (agent-shell--count-group-thought state group-id))
              (agent-shell--refresh-activity-group-header state group-id))
@@ -2660,6 +2869,7 @@ No-op while that function has nothing to summarize (an empty group)."
                                  (append '("session/load")
                                          (agent-shell-experimental--methods))))
                        (map-elt state :active-requests))
+             (agent-shell--flush-transcript-for-boundary state)
              (let ((new-prompt-p (not (equal (map-elt state :last-entry-type)
                                              "user_message_chunk")))
                    (content-text (or (map-nested-elt acp-notification '(params update content text))
@@ -2711,6 +2921,7 @@ No-op while that function has nothing to summarize (an empty group)."
               :append t
               :above-last-prompt t))))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "plan")
+           (agent-shell--flush-transcript-for-boundary state)
            (agent-shell--update-fragment
             :state state
             :block-id "plan"
@@ -2720,6 +2931,7 @@ No-op while that function has nothing to summarize (an empty group)."
             :above-last-prompt (not (agent-shell--active-requests-p state)))
            (map-put! state :last-entry-type "plan"))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "tool_call_update")
+           (agent-shell--flush-transcript-for-boundary state)
            ;; Update stored tool call data with new status and content
            (agent-shell--save-tool-call
             state
@@ -3581,9 +3793,11 @@ DIFFS is a list of diff infos as returned by
 (cl-defun agent-shell--make-error-handler (&key state shell-buffer)
   "Create ACP error handler with SHELL-BUFFER STATE."
   (lambda (acp-error raw-message)
-    (agent-shell-heartbeat-stop
-     :heartbeat (map-elt state :heartbeat))
+    (unless (agent-shell-experimental--clear-session-push state)
+      (agent-shell-heartbeat-stop
+       :heartbeat (map-elt state :heartbeat)))
     (with-current-buffer (map-elt state :buffer)
+      (agent-shell--flush-transcript-for-boundary state)
       (agent-shell--update-fragment
        :state (agent-shell--state)
        :block-id (format "failed-%s-id:%s-code:%s"
@@ -3594,7 +3808,8 @@ DIFFS is a list of diff infos as returned by
               :code (map-elt acp-error 'code)
               :message (map-elt acp-error 'message)
               :raw-message raw-message)
-       :create-new t))
+       :create-new t)
+      (map-put! state :last-entry-type "error"))
     ;; TODO: Mark buffer command with shell failure.
     (with-current-buffer shell-buffer
       (agent-shell--emit-event :event 'error
@@ -3703,15 +3918,18 @@ For example, shut down ACP client."
   "Shut down shell activity."
   (unless (derived-mode-p 'agent-shell-mode)
     (error "Not in a shell"))
-  (when (map-elt (agent-shell--state) :client)
-    (acp-shutdown :client (map-elt (agent-shell--state) :client))
-    (map-put! (agent-shell--state) :client nil)
-    (map-put! (agent-shell--state) :initialized nil)
-    (map-put! (agent-shell--state) :authenticated nil)
-    (map-put! (agent-shell--state) :set-model nil)
-    (map-put! (agent-shell--state) :set-session-mode nil))
-  (agent-shell-heartbeat-stop
-   :heartbeat (map-elt (agent-shell--state) :heartbeat)))
+  (let ((push-cleared (agent-shell-experimental--clear-session-push
+                       (agent-shell--state))))
+    (when (map-elt (agent-shell--state) :client)
+      (acp-shutdown :client (map-elt (agent-shell--state) :client))
+      (map-put! (agent-shell--state) :client nil)
+      (map-put! (agent-shell--state) :initialized nil)
+      (map-put! (agent-shell--state) :authenticated nil)
+      (map-put! (agent-shell--state) :set-model nil)
+      (map-put! (agent-shell--state) :set-session-mode nil))
+    (unless push-cleared
+      (agent-shell-heartbeat-stop
+       :heartbeat (map-elt (agent-shell--state) :heartbeat)))))
 
 (defcustom agent-shell-dot-subdir-function #'agent-shell--dot-subdir-in-repo
   "Function used by `agent-shell--dot-subdir' to resolve subdirectory paths.
@@ -4132,6 +4350,7 @@ variable (see makunbound)"))
                                       :needs-authentication (map-elt config :needs-authentication)
                                       :authenticate-request-maker (map-elt config :authenticate-request-maker)
                                       :outgoing-request-decorator (or outgoing-request-decorator
+                                                                      (map-elt config :outgoing-request-decorator)
                                                                       agent-shell-outgoing-request-decorator)
                                       :agent-config config))
       ;; Initialize buffer-local shell-maker-config
@@ -5771,9 +5990,8 @@ Call ON-SUCCESS on success, or ON-FAILURE on error."
                        (message "Failed to change model: %s" acp-error))))))
 
 (cl-defun agent-shell--config-option-set-mode-id (&key mode-id on-success on-failure)
-  "Set current session mode to MODE-ID.
-Call ON-SUCCESS on success, or ON-FAILURE on error."
-  (if-let* ((mode-option (agent-shell--config-option-by-category (agent-shell--state) "mode")))
+  "Set current session mode to MODE-ID."
+  (if-let* ((mode-option (agent-shell--session-mode-config-option (agent-shell--state))))
       (agent-shell--set-session-config-option
        :config-id (map-elt mode-option :id)
        :value mode-id
@@ -5952,6 +6170,38 @@ so `string>' yields descending time order.
                        (or (map-elt b 'updatedAt)
                            (map-elt b 'createdAt) "")))
             acp-sessions))
+
+(defun agent-shell--filter-sessions (acp-sessions)
+  "Apply the current agent config's session predicate to ACP-SESSIONS."
+  (if-let* ((config (map-elt (agent-shell--state) :agent-config))
+            (predicate (map-elt config :session-list-filter-function)))
+      (seq-filter predicate acp-sessions)
+    acp-sessions))
+
+(defun agent-shell--session-list-filter-by-cwd-p ()
+  "Return non-nil when session/list should be scoped to the current cwd."
+  (let ((config (map-elt agent-shell--state :agent-config)))
+    (if (assq :session-list-filter-by-cwd config)
+        (not (eq (map-elt config :session-list-filter-by-cwd) nil))
+      t)))
+
+(defun agent-shell--make-session-list-request (&optional cwd)
+  "Return an ACP session/list request.
+
+When CWD is non-nil, use `acp-make-session-list-request' so the
+request is filtered by working directory.  When CWD is nil, build
+the request with an empty params object; this is useful for agents whose
+older persisted sessions have no cwd metadata and would otherwise be
+hidden from the picker."
+  (if cwd
+      (acp-make-session-list-request :cwd cwd)
+    (list '(:method . "session/list")
+          (cons :params (make-hash-table :test #'equal)))))
+
+(defun agent-shell--session-list-cwd ()
+  "Return cwd to pass to session/list, or nil for an unfiltered list."
+  (when (agent-shell--session-list-filter-by-cwd-p)
+    (agent-shell--resolve-path (agent-shell-cwd))))
 
 (defun agent-shell--format-session-date (iso-timestamp)
   "Format ISO-TIMESTAMP as a human-friendly date string.
@@ -6576,12 +6826,14 @@ SESSION-TITLE is an optional display title for the resumed session."
   (agent-shell--send-request
    :state (agent-shell--state)
    :client (map-elt (agent-shell--state) :client)
-   :request (acp-make-session-list-request
-             :cwd (agent-shell--resolve-path (agent-shell-cwd)))
+   :request (agent-shell--make-session-list-request
+             (agent-shell--session-list-cwd))
    :buffer (current-buffer)
    :on-success (lambda (acp-response)
-                 (let ((acp-sessions (agent-shell--sort-sessions-by-recency
-                                      (append (or (map-elt acp-response 'sessions) '()) nil))))
+                 (let ((acp-sessions
+                        (agent-shell--sort-sessions-by-recency
+                         (agent-shell--filter-sessions
+                          (append (or (map-elt acp-response 'sessions) '()) nil)))))
                    (condition-case nil
                        (let* ((acp-session
                                (pcase agent-shell-session-strategy
@@ -6751,6 +7003,7 @@ The agent config's `:mcp-servers' take precedence over the global
   (acp-subscribe-to-errors
    :client (map-elt state :client)
    :on-error (lambda (acp-error)
+               (agent-shell--flush-transcript-for-boundary state)
                (agent-shell--update-fragment
                 :state state
                 :block-id (format "%s-notices"
@@ -6760,7 +7013,8 @@ The agent config's `:mcp-servers' take precedence over the global
                           (map-elt acp-error 'data)
                           "Something is up ¯\\_ (ツ)_/¯")
                 :append t
-                :above-last-prompt (not (shell-maker-busy)))))
+                :above-last-prompt (not (shell-maker-busy)))
+               (map-put! state :last-entry-type "error")))
   (acp-subscribe-to-notifications
    :client (map-elt state :client)
    :on-notification (lambda (acp-notification)
@@ -7109,8 +7363,9 @@ capability, since the `session/list' request would otherwise fail."
               (session-id (map-nested-elt agent-shell--state '(:session :id))))
     (acp-send-request
      :client client
-     :request (acp-make-session-list-request
-               :cwd (agent-shell--resolve-path default-directory))
+     :request (agent-shell--make-session-list-request
+               (when (agent-shell--session-list-filter-by-cwd-p)
+                 (agent-shell--resolve-path default-directory)))
      :buffer (current-buffer)
      :on-success
      (lambda (acp-response)
@@ -7141,7 +7396,8 @@ Each marked span is replaced by its `agent-shell-region-text' value."
 
 (cl-defun agent-shell--send-command (&key prompt shell-buffer)
   "Send PROMPT to agent using SHELL-BUFFER."
-  (let* ((expanded-prompt (agent-shell--expand-truncated-regions prompt))
+  (let* ((prompt (agent-shell--strip-shell-maker-markers prompt))
+         (expanded-prompt (agent-shell--expand-truncated-regions prompt))
          (content-blocks (condition-case nil
                              (agent-shell--build-content-blocks expanded-prompt)
                            (error `[((type . "text")
@@ -7156,6 +7412,7 @@ Each marked span is replaced by its `agent-shell-region-text' value."
     (agent-shell--cancel-idle-timer)
     (agent-shell--emit-event :event 'input-submitted)
 
+    (agent-shell--flush-transcript-for-boundary agent-shell--state)
     (map-put! agent-shell--state :last-entry-type nil)
 
     ;; Seed the session title with the first user prompt so consumers
@@ -7190,6 +7447,7 @@ Each marked span is replaced by its `agent-shell-region-text' value."
      :buffer (current-buffer)
      :on-success (lambda (acp-response)
                    (agent-shell--separate-transcript-after-agent-message
+                    :state (agent-shell--state)
                     :last-entry-type (map-elt (agent-shell--state) :last-entry-type)
                     :file-path agent-shell--transcript-file)
                    ;; Tool call details are no longer needed after
@@ -7201,6 +7459,11 @@ Each marked span is replaced by its `agent-shell-region-text' value."
                      (agent-shell--save-usage :state (agent-shell--state) :acp-usage (map-elt acp-response 'usage)))
                    (let ((success (equal (map-elt acp-response 'stopReason)
                                          "end_turn")))
+                     ;; Display a diagnostic instead of a silent blank turn when
+                     ;; a server resolves the prompt but sent no visible update.
+                     (when (and success
+                                (not (map-elt (agent-shell--state) :last-entry-type)))
+                       (agent-shell--display-empty-turn-notice (agent-shell--state)))
                      ;; Display usage box at end of turn if enabled and data available
                      (when (and success
                                 agent-shell-show-usage-at-turn-end
@@ -7245,6 +7508,7 @@ Each marked span is replaced by its `agent-shell-region-text' value."
                    ;; without a trailing newline.  Separate it so the
                    ;; next section header lands on its own line.
                    (agent-shell--separate-transcript-after-agent-message
+                    :state agent-shell--state
                     :last-entry-type (map-elt agent-shell--state :last-entry-type)
                     :file-path agent-shell--transcript-file)
                    ;; Display pending requests on failure.
@@ -8470,7 +8734,7 @@ Uses AGENT-CWD to shorten file paths where necessary."
 
 (defun agent-shell--buffer-substring-with-faces (start end)
   "Return text between START and END, preserving only face properties."
-  (let ((text (buffer-substring start end))
+  (let ((text (agent-shell--filter-buffer-substring start end))
         (pos 0))
     (while (< pos (length text))
       (let ((next (or (next-property-change pos text) (length text)))
@@ -8716,7 +8980,9 @@ Available values:
   (when (region-active-p)
     (let ((start (region-beginning))
           (end (region-end))
-          (content (buffer-substring-no-properties (region-beginning) (region-end)))
+          (content (substring-no-properties
+                    (agent-shell--filter-buffer-substring
+                     (region-beginning) (region-end))))
           (language (string-remove-suffix "-mode" (string-remove-suffix "-ts-mode" (symbol-name major-mode))))
           (file (buffer-file-name)))
       (when deactivate
@@ -8827,7 +9093,7 @@ STATE is the agent shell state.
 
 Returns the modes list from session if available, otherwise from
 the agent's available modes."
-  (if-let* ((mode-option (agent-shell--config-option-by-category state "mode")))
+  (if-let* ((mode-option (agent-shell--session-mode-config-option state)))
       (agent-shell--config-option-as-modes mode-option)
     (or (map-nested-elt state '(:session :modes))
         ;; Use agent-level availability as fallback.
@@ -9446,18 +9712,34 @@ For example:
       (error
        (message "Error writing to transcript: %S" err)))))
 
-(cl-defun agent-shell--separate-transcript-after-agent-message (&key last-entry-type file-path)
-  "Append a blank-line separator to the transcript at FILE-PATH.
+(cl-defun agent-shell--flush-pending-transcript-separator (&key state file-path)
+  "Flush STATE's deferred transcript separator to FILE-PATH."
+  (when state
+    (agent-shell--ensure-state-key state :pending-transcript-separator))
+  (when (and state (map-elt state :pending-transcript-separator))
+    (agent-shell--append-transcript
+     :text (map-elt state :pending-transcript-separator)
+     :file-path file-path)
+    (map-put! state :pending-transcript-separator nil)))
 
-Write the separator only when LAST-ENTRY-TYPE is
-\"agent_message_chunk\", i.e. the turn ended while streaming an
-agent message.  An agent message chunk may end without a trailing
-newline (for example when interrupted), and without this separator
-the next transcript section header lands on the same line as the
-message body.  Call this at turn end on both the success and
-failure paths."
+(cl-defun agent-shell--separate-transcript-after-agent-message (&key state last-entry-type file-path)
+  "Separate an agent message from the next transcript section.
+
+When STATE is nil, append a blank-line separator immediately to
+FILE-PATH for the legacy call path.
+
+When STATE is non-nil, defer the separator in STATE instead.  A
+final chunk may still arrive after request completion; deferring
+keeps that late tail contiguous with its streaming group and lets
+the next real transcript section flush the separator.  Thought
+groups have their own transcript section and do not need this
+message-body separator; same-group thought tails append directly."
   (when (equal last-entry-type "agent_message_chunk")
-    (agent-shell--append-transcript :text "\n\n" :file-path file-path)))
+    (if state
+        (progn
+          (agent-shell--ensure-state-key state :pending-transcript-separator)
+          (map-put! state :pending-transcript-separator "\n\n"))
+      (agent-shell--append-transcript :text "\n\n" :file-path file-path))))
 
 (defun agent-shell--extract-tool-parameters (raw-input)
   "Extract and format tool parameters from RAW-INPUT.
