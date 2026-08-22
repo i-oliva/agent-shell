@@ -152,9 +152,15 @@ When nil, use the current `default' face foreground."
     (let* ((source (buffer-substring-no-properties beg end))
            (file (agent-shell-math-render-to-file source))
            (image (create-image file 'svg nil :ascent 'center)))
-      (add-text-properties beg end '(agent-shell-math-preview t))
+      (add-text-properties
+       beg end
+       (list 'agent-shell-math-preview t
+             'agent-shell-markdown-frozen t
+             'agent-shell-markdown-source source))
       (put-text-property beg end 'rear-nonsticky
-                          '(display invisible agent-shell-math-preview))
+                          '(display invisible agent-shell-math-preview
+                            agent-shell-markdown-frozen
+                            agent-shell-markdown-source))
       (put-text-property beg (min (1+ beg) end) 'display image)
       (when (< (1+ beg) end)
         ;; Do not rely on `invisible' here: agent-shell buffers may not have a
@@ -183,16 +189,87 @@ Skip matches inside AVOID-RANGES, such as Markdown fenced code blocks."
         (condition-case err
             (agent-shell-math--preview-source beg finish)
           (error
-           (message "agent-shell math preview failed: %s" (error-message-string err)))))
+           ;; Keep valid LaTeX intact if image generation fails.
+           (add-text-properties
+            beg finish
+            (list 'agent-shell-markdown-frozen t
+                  'agent-shell-markdown-source
+                  (buffer-substring-no-properties beg finish)))
+           (message "agent-shell math preview failed: %s"
+                    (error-message-string err)))))
       (goto-char finish))))
 
-(defun agent-shell-math--source-block-avoid-ranges ()
-  "Return Markdown fenced source-block ranges for math rendering."
+(defun agent-shell-math--context-avoid-ranges (context)
+  "Return code ranges from agent-shell Markdown render CONTEXT."
   (agent-shell-markdown-sort-ranges
-   (mapcar (lambda (source-block)
-             (cons (map-nested-elt source-block '(:block :start))
-                   (map-nested-elt source-block '(:block :end))))
-           (agent-shell-markdown--source-blocks))))
+   (append
+    (map-elt context :inline-code-ranges)
+    (mapcar (lambda (source-block)
+              (cons (map-nested-elt source-block '(:block :start))
+                    (map-nested-elt source-block '(:block :end))))
+            (map-elt context :source-blocks)))))
+
+(defun agent-shell-math--unclosed-delimiter-start (avoid-ranges)
+  "Return the earliest unclosed math delimiter outside AVOID-RANGES."
+  (let (earliest)
+    (dolist (spec '(("\\[" . "\\]") ("$$" . "$$") ("\\(" . "\\)")))
+      (save-excursion
+        (goto-char (point-min))
+        (let ((opener (regexp-quote (car spec)))
+              (closer (regexp-quote (cdr spec))))
+          (while (re-search-forward opener nil t)
+            (let ((beg (match-beginning 0)))
+              (cond
+               ((or (agent-shell-math--protected-p beg)
+                    (agent-shell-markdown-in-avoid-range-p
+                     beg (min (1+ beg) (point-max)) avoid-ranges)))
+               ((let ((close-end
+                       (save-excursion
+                         (when (re-search-forward closer nil t)
+                           (match-end 0)))))
+                  (if close-end (progn (goto-char close-end) t) nil)))
+               (t
+                (setq earliest (if earliest (min earliest beg) beg))
+                (goto-char (point-max)))))))))
+    earliest))
+
+(defun agent-shell-math--clear-pending ()
+  "Unfreeze math held pending from an earlier streaming pass."
+  (let ((pos (point-min)))
+    (while (< pos (point-max))
+      (let ((next (next-single-property-change
+                   pos 'agent-shell-math-pending nil (point-max))))
+        (when (get-text-property pos 'agent-shell-math-pending)
+          (remove-list-of-text-properties
+           pos next
+           '(agent-shell-math-pending agent-shell-markdown-frozen)))
+        (setq pos next)))))
+
+(defun agent-shell-math--mark-pending (beg end)
+  "Protect incomplete math between BEG and END until more text arrives."
+  (add-text-properties
+   beg end
+   '(agent-shell-math-pending t agent-shell-markdown-frozen t))
+  ;; Text appended by the next streaming chunk must remain unfrozen so the
+  ;; complete expression can be reconsidered from the saved watermark.
+  (put-text-property
+   beg end 'rear-nonsticky
+   '(agent-shell-math-pending agent-shell-markdown-frozen)))
+
+(defun agent-shell-math-render-context (context)
+  "Render math before agent-shell built-in Markdown styling passes."
+  (when agent-shell-math-preview-enabled
+    (save-excursion
+      (agent-shell-math--clear-pending)
+      (let ((avoid-ranges (agent-shell-math--context-avoid-ranges context)))
+        (agent-shell-math--render-pattern
+         agent-shell-math--display-math-pattern (point-max) avoid-ranges)
+        (agent-shell-math--render-pattern
+         agent-shell-math--inline-math-pattern (point-max) avoid-ranges)
+        (when-let* ((watermark
+                     (agent-shell-math--unclosed-delimiter-start avoid-ranges)))
+          (agent-shell-math--mark-pending watermark (point-max))
+          (list (cons :watermark watermark)))))))
 
 (defun agent-shell-math-preview-region (beg end)
   "Render LaTeX math previews between BEG and END in the current buffer."
@@ -200,11 +277,7 @@ Skip matches inside AVOID-RANGES, such as Markdown fenced code blocks."
     (save-excursion
       (save-restriction
         (narrow-to-region beg end)
-        (let ((avoid-ranges (agent-shell-math--source-block-avoid-ranges)))
-          (agent-shell-math--render-pattern
-           agent-shell-math--display-math-pattern (point-max) avoid-ranges)
-          (agent-shell-math--render-pattern
-           agent-shell-math--inline-math-pattern (point-max) avoid-ranges))))))
+        (agent-shell-math-render-context (agent-shell-markdown-context))))))
 
 (cl-defun agent-shell-math-render-markdown (&key (render-images t)
                                                  (highlight-blocks t)
@@ -212,12 +285,20 @@ Skip matches inside AVOID-RANGES, such as Markdown fenced code blocks."
                                                  &allow-other-keys)
   "Render agent-shell Markdown, then render LaTeX math snippets.
 Accepts the same keyword arguments as `agent-shell-markdown-render-function'."
-  (agent-shell-markdown-replace-markup
-   :render-images render-images
-   :highlight-blocks highlight-blocks
-   :image-cache-directory image-cache-directory)
-  (agent-shell-math--hide-metadata-lines)
-  (agent-shell-math-preview-region (point-min) (point-max)))
+  ;; agent-shell 0.73+ decodes escapes during built-in Markdown passes.
+  ;; Claim math through the pre-render hook before those passes run.
+  (let ((agent-shell-markdown-render-functions
+         (if (and render-images
+                  (not (memq #'agent-shell-math-render-context
+                             agent-shell-markdown-render-functions)))
+             (cons #'agent-shell-math-render-context
+                   agent-shell-markdown-render-functions)
+           agent-shell-markdown-render-functions)))
+    (agent-shell-markdown-replace-markup
+     :render-images render-images
+     :highlight-blocks highlight-blocks
+     :image-cache-directory image-cache-directory))
+  (agent-shell-math--hide-metadata-lines))
 
 (provide 'agent-shell-math)
 
