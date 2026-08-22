@@ -6,7 +6,7 @@
 ;;; Code:
 
 (ert-deftest agent-shell-session-push-status-lifecycle-test ()
-  "A push is tracked as active and answered on session_push_end (v0.66.1)."
+  "A push is tracked as active and answered on session_push_end (v0.74.3)."
   (with-temp-buffer
     (let* ((responses nil)
            (heartbeat-started nil)
@@ -27,6 +27,8 @@
                  (lambda (&rest _args)
                    (setq heartbeat-stopped t)))
                 ((symbol-function 'agent-shell-experimental--remove-trailing-prompt)
+                 (lambda () nil))
+                ((symbol-function 'shell-maker-insert-end-of-prompt-marker)
                  (lambda () nil)))
         (let ((agent-shell-show-busy-indicator t))
           (agent-shell-experimental--on-session-push-request
@@ -69,7 +71,7 @@
                        (list active-request)))))))
 
 (ert-deftest agent-shell-session-push-viewport-is-busy-test ()
-  "Viewport busy state follows the shell busy variable (v0.66.1)."
+  "Viewport busy state follows the shell busy variable (v0.74.3)."
   (with-temp-buffer
     (let ((shell-buffer (current-buffer)))
       (setq-local shell-maker--busy t)
