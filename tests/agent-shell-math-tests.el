@@ -15,6 +15,125 @@
            'agent-shell-markdown-frozen t
            'agent-shell-markdown-source source))))
 
+(defun agent-shell-math-tests--overlays (kind)
+  "Return math renderer overlays of KIND in the current buffer."
+  (seq-filter (lambda (overlay)
+                (eq (overlay-get overlay 'agent-shell-math-overlay) kind))
+              (overlays-in (point-min) (point-max))))
+
+(defmacro agent-shell-math-tests--with-fake-image-render (&rest body)
+  "Run BODY with image support and LaTeX compilation stubbed."
+  (declare (indent 0) (debug t))
+  `(cl-letf (((symbol-function 'display-images-p) (lambda (&optional _) t))
+              ((symbol-function 'image-type-available-p) (lambda (_) t))
+              ((symbol-function 'create-image)
+               (lambda (&rest _) '(image :type svg :data "fake")))
+              ((symbol-function 'agent-shell-math-render-latex-to-file)
+               (lambda (&rest _) "/tmp/agent-shell-math-test.svg")))
+      ,@body))
+
+(ert-deftest agent-shell-math-detects-complete-fenced-latex-block-test ()
+  "A complete latex fence is exposed through the Markdown render context."
+  (with-temp-buffer
+    (insert (concat "```latex\n3x + 2 < 11\n```"))
+    (let ((block (car (map-elt (agent-shell-markdown-context) :source-blocks))))
+      (should (equal "latex" (map-elt block :language)))
+      (should (equal "3x + 2 < 11" (map-elt block :body)))
+      (should (map-elt block :complete)))))
+
+(ert-deftest agent-shell-math-renders-complete-fenced-latex-block-test ()
+  "A complete latex fence is claimed before normal code-block styling."
+  (with-temp-buffer
+    (insert (concat "```latex\n3x + 2 < 11\n```\n"))
+    (let ((calls 0))
+      (cl-letf (((symbol-function 'display-images-p) (lambda (&optional _) t))
+                ((symbol-function 'image-type-available-p) (lambda (_) t))
+                ((symbol-function 'create-image)
+                 (lambda (&rest _) '(image :type svg :data "fake")))
+                ((symbol-function 'agent-shell-math-render-latex-to-file)
+                 (lambda (&rest _)
+                   (setq calls (1+ calls))
+                   "/tmp/agent-shell-math-test.svg")))
+        (agent-shell-markdown-replace-markup :complete t))
+      (should (= calls 1)))
+    (should (get-text-property (point-min) 'agent-shell-math-preview))
+    (should (get-text-property (point-min) 'display))
+    (should (get-text-property (point-min) 'agent-shell-markdown-frozen))
+    (should (equal "3x + 2 < 11"
+                   (get-text-property (point-min) 'agent-shell-math-source)))
+    ;; The raw Markdown remains in the buffer for copying, while its display
+    ;; properties show the native preview and prevent the built-in code pass
+    ;; from deleting or re-styling it.
+    (should (string-match-p "```latex"
+                            (buffer-substring-no-properties
+                             (point-min) (point-max))))))
+
+(ert-deftest agent-shell-math-streaming-fenced-latex-block-test ()
+  "An open latex fence waits for its closing fence, then renders."
+  (with-temp-buffer
+    (insert "before\n")
+    (let ((block-beg (point)))
+      (insert (concat "```latex\n3x + 2 < 11"))
+    (let ((calls 0))
+      (cl-letf (((symbol-function 'display-images-p) (lambda (&optional _) t))
+                ((symbol-function 'image-type-available-p) (lambda (_) t))
+                ((symbol-function 'create-image)
+                 (lambda (&rest _) '(image :type svg :data "fake")))
+                ((symbol-function 'agent-shell-math-render-latex-to-file)
+                 (lambda (&rest _)
+                   (setq calls (1+ calls))
+                   "/tmp/agent-shell-math-test.svg")))
+        (agent-shell-markdown-replace-markup))
+      (should (= calls 0)))
+    (let ((pending (agent-shell-math-tests--overlays 'pending)))
+      (should (= 1 (length pending)))
+      (should (string-match-p "closing fence"
+                              (overlay-get (car pending) 'display))))
+    (goto-char (point-max))
+    (insert (concat "\n```\n"))
+    (cl-letf (((symbol-function 'display-images-p) (lambda (&optional _) t))
+              ((symbol-function 'image-type-available-p) (lambda (_) t))
+              ((symbol-function 'create-image)
+               (lambda (&rest _) '(image :type svg :data "fake")))
+              ((symbol-function 'agent-shell-math-render-latex-to-file)
+               (lambda (&rest _) "/tmp/agent-shell-math-test.svg")))
+      (agent-shell-markdown-replace-markup :complete t))
+    (should-not (agent-shell-math-tests--overlays 'pending))
+      (should (get-text-property block-beg 'agent-shell-math-preview)))))
+
+(ert-deftest agent-shell-math-invalid-fenced-latex-falls-back-with-error-test ()
+  "A compiler failure leaves source intact and reports an in-buffer error."
+  (with-temp-buffer
+    (insert (concat "```latex\n\\\\thiscommanddoesnotexist\n```\n"))
+    (cl-letf (((symbol-function 'display-images-p) (lambda (&optional _) t))
+              ((symbol-function 'image-type-available-p) (lambda (_) t))
+              ((symbol-function 'agent-shell-math-render-latex-to-file)
+               (lambda (&rest _) (error "LaTeX compilation failed (1)"))))
+      (agent-shell-markdown-replace-markup :complete t))
+    (let ((errors (agent-shell-math-tests--overlays 'error)))
+      (should (= 1 (length errors)))
+      (should (string-match-p "LaTeX compilation failed"
+                              (overlay-get (car errors) 'before-string))))
+    (should (string-match-p "thiscommanddoesnotexist"
+                            (buffer-substring-no-properties
+                             (point-min) (point-max))))
+    (should-not (get-text-property (point-min) 'agent-shell-math-preview))))
+
+(ert-deftest agent-shell-math-normal-code-block-regression-test ()
+  "Ordinary fenced code remains a normal Markdown code block."
+  (with-temp-buffer
+    (insert (concat "```python\nprint('hello')\n```\n"))
+    (agent-shell-math-tests--with-fake-image-render
+      (agent-shell-markdown-replace-markup :complete t))
+    (should-not (text-property-not-all (point-min) (point-max)
+                                       'agent-shell-math-preview nil))
+    (should (string-match-p "python .*⧉"
+                            (buffer-substring-no-properties
+                             (point-min) (point-max))))
+    (should (string-match-p "print('hello')"
+                            (buffer-substring-no-properties
+                             (point-min) (point-max))))))
+
 (ert-deftest agent-shell-math-render-markdown-accepts-agent-shell-keywords-test ()
   "The Doom/local math renderer accepts the agent-shell renderer contract."
   (with-temp-buffer
@@ -78,6 +197,11 @@
         (should (equal formula
                        (get-text-property open
                                           'agent-shell-markdown-source)))))))
+
+(ert-deftest agent-shell-math-registers-render-context-test ()
+  "Loading the math extension registers its pre-Markdown renderer."
+  (should (memq #'agent-shell-math-render-context
+                agent-shell-markdown-render-functions)))
 
 (provide 'agent-shell-math-tests)
 
