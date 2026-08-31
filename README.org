@@ -37,6 +37,7 @@ With agent-shell, you can interact with any ACP-driven agent like:
 - [[https://github.com/svkozak/pi-acp][Pi]]
 - [[https://github.com/can1357/oh-my-pi][Oh My Pi]]
 - [[https://opencode.ai][Opencode]]
+- [[https://antigravity.google/docs/ide/extensions][Antigravity]] (Google)
 
 [[https://www.youtube.com/watch?v=R2Ucr3amgGg][agent-shell - YouTube]]
 
@@ -98,6 +99,7 @@ We now have a handful of additional packages to extend the =agent-shell= experie
 - [[https://github.com/wandersoncferreira/agent-shell-dashboard][agent-shell-dashboard]]: A landing page for =agent-shell=.
 - [[https://github.com/SreenivasVRao/agent-shell-hq][agent-shell-hq]]: A heads-up display and peek interface for managing multiple =agent-shell= sessions, organized by project.
 - [[https://github.com/Jamie-Cui/agent-shell-permission-transient][agent-shell-permission-transient]]: A compact Transient interface for responding to queued agent-shell permission requests.
+- [[https://github.com/tychoish/agent-shell-queue][agent-shell-queue]]: A flexible prompt/shell queue for =agent-shell= sessions.
 
 * Articles
 - 20Y: [[https://20y.hu/~slink/journal/agent-shell/index.html][Agentic development workflow in Emacs]]
@@ -252,6 +254,46 @@ bun install -g @oh-my-pi/pi-coding-agent
 #+end_src
 
 See https://github.com/can1357/oh-my-pi for details.
+
+*** Antigravity
+
+For Antigravity, download the =agy_acp_server= binary for your platform from the [[https://github.com/agentclientprotocol/registry/tree/main/antigravity-acp][ACP registry entry]] and make sure it's on your =PATH= (or set =agent-shell-antigravity-acp-command= to an absolute path).
+
+Alternatively, you can bootstrap the antigravity tool with the following function:
+
+#+begin_src emacs-lisp
+  (defun agent-shell-antigravity-bootstrap (&optional force)
+    "Download and install the latest Antigravity ACP server binary."
+    (interactive "P")
+    (let* ((arch (pcase (car (split-string system-configuration "-"))
+                   ((or "x86_64" "amd64") "x86_64")
+                   ((or "aarch64" "arm64") "aarch64")
+                   (a a)))
+           (os (pcase system-type ('darwin "darwin") ('windows-nt "windows") (_ "linux")))
+           (platform (format "%s-%s" os arch))
+           (install-dir (agent-shell-cache-dir "antigravity" platform))
+           (bin-name (file-name-nondirectory (car agent-shell-antigravity-acp-command)))
+           (bin-path (expand-file-name bin-name install-dir)))
+      (unless (and (not force) (file-executable-p bin-path))
+        (message "Antigravity: bootstrapping server for %s..." platform)
+        (make-directory install-dir t)
+        (let* ((reg-url "https://raw.githubusercontent.com/agentclientprotocol/registry/main/antigravity-acp/agent.json")
+               (reg (with-temp-buffer
+                      (url-insert-file-contents reg-url)
+                      (json-parse-buffer :object-type 'alist)))
+               (archive-url (map-nested-elt reg `(distribution binary ,(intern platform) archive)))
+               (zip (expand-file-name "server.zip" install-dir)))
+          (url-copy-file archive-url zip t)
+          (call-process "unzip" nil nil nil "-o" "-q" zip "-d" install-dir)
+          (delete-file zip)
+          (set-file-modes bin-path #o755)))
+      (setq agent-shell-antigravity-acp-command
+            (cons bin-path (cdr agent-shell-antigravity-acp-command)))
+      (message "Antigravity: using ACP server at %s" bin-path)
+      bin-path))
+#+end_src
+
+See https://antigravity.google/docs/ide/extensions for details.
 
 *** Opencode + local ollama models
 
@@ -417,6 +459,49 @@ For alternative Anthropic-compatible API endpoints, configure via environment va
          "ANTHROPIC_BASE_URL" "https://api.moonshot.cn/anthropic"
          "ANTHROPIC_MODEL" "kimi-k2-turbo-preview"
          "ANTHROPIC_SMALL_FAST_MODEL" "kimi-k2-turbo-preview"))
+#+end_src
+
+*** Antigravity
+
+For login-based authentication (default, Google account):
+
+#+begin_src emacs-lisp
+(setq agent-shell-antigravity-authentication
+      (agent-shell-antigravity-make-authentication :login t))
+#+end_src
+
+For API key authentication:
+
+#+begin_src emacs-lisp
+;; With string
+(setq agent-shell-antigravity-authentication
+      (agent-shell-antigravity-make-authentication :api-key "your-gemini-api-key-here"))
+
+;; With function
+(setq agent-shell-antigravity-authentication
+      (agent-shell-antigravity-make-authentication
+       :api-key (lambda () (auth-source-pass-get 'secret "gemini-api-key"))))
+#+end_src
+
+For Gemini Enterprise authentication:
+
+#+begin_src emacs-lisp
+(setq agent-shell-antigravity-authentication
+      (agent-shell-antigravity-make-authentication :business t))
+#+end_src
+
+For Gemini Enterprise Agent Platform authentication:
+
+#+begin_src emacs-lisp
+(setq agent-shell-antigravity-authentication
+      (agent-shell-antigravity-make-authentication :agent-platform t))
+#+end_src
+
+For no authentication (when managed externally):
+
+#+begin_src emacs-lisp
+(setq agent-shell-antigravity-authentication
+      (agent-shell-antigravity-make-authentication :none t))
 #+end_src
 
 *** Google Gemini
@@ -672,10 +757,21 @@ In view mode, use =r= to compose a reply, =R= to quote the response in a reply, 
 Do not invoke =agent-shell-viewport-edit-mode= or =agent-shell-viewport-view-mode= directly in an agent shell buffer.  They are major modes installed by the entry points above on the separate viewport buffer, not commands for converting the shell buffer.
 #+end_quote
 
+*** Steering a running turn
+
+A prompt sent while the agent is working is queued and submitted once the turn ends.  Agents that support steering can take it into the turn already running instead, so a wrong direction can be corrected without waiting for it to finish.  Steering is an ACP extension (=_session/steering=) rather than part of the spec, advertised by the agent at initialization: the Claude and Codex packages implement it, other agents keep queueing.
+
+Steering is always explicit.  =M-x agent-shell-prompt-queue= queues, as it always has.  =M-x agent-shell-prompt-steer= steers, and errors when there is no running turn to steer or the agent cannot steer.  When the agent declines a steer, the running turn is interrupted and the shell says so, rather than letting the agent carry on in a direction you believe you already corrected.
+
+What the agent does with the steered prompt is up to the agent: Claude interrupts what it is generating and responds to it, while Codex finishes the message in flight first.
+
+Steering is not additive.  An agent that interrupts may drop the instruction it was working on, so a steer can replace what the agent was already doing rather than adding to it.  Queue instead when the agent should finish first.
+
 *** Specific Agent Commands
 
 Start a specific agent shell session directly:
 
+- =M-x agent-shell-antigravity-start-agent= - Start an Antigravity agent session
 - =M-x agent-shell-anthropic-start-claude-code= - Start a Claude Agent session
 - =M-x agent-shell-auggie-start-agent= - Start an Auggie agent session
 - =M-x agent-shell-codebuddy-start-agent= - Start a CodeBuddy agent session
@@ -913,6 +1009,9 @@ always go to Evil modes if you need to with ~C-z~).
 |-----------------------------------------------+---------------------------------------------------------------------------------|
 | agent-shell-activity-group-expand-by-default  | When activity group sections should be expanded.                                |
 | agent-shell-agent-configs                     | The list of known agent configurations.                                         |
+| agent-shell-antigravity-acp-command           | Command and parameters for the Antigravity ACP server.                          |
+| agent-shell-antigravity-authentication        | Configuration for Antigravity authentication.                                    |
+| agent-shell-antigravity-environment           | Environment variables for the Antigravity ACP server.                           |
 | agent-shell-anthropic-authentication          | Configuration for Anthropic authentication.                                     |
 | agent-shell-anthropic-claude-acp-command      | Command and parameters for the Anthropic Claude client.                         |
 | agent-shell-anthropic-claude-command          | Command and parameters for the Anthropic Claude client.                         |
@@ -1036,6 +1135,7 @@ always go to Evil modes if you need to with ~C-z~).
 |                 | agent-shell                                             | Start or reuse an existing agent shell.                                       |
 |                 | agent-shell--display-buffer                             | Toggle agent SHELL-BUFFER display.                                            |
 |                 | agent-shell-anthropic-start-claude-code                 | Start an interactive Claude Agent shell.                                      |
+|                 | agent-shell-antigravity-start-agent                     | Start an interactive Antigravity agent shell.                                 |
 |                 | agent-shell-auggie-start-agent                          | Start an interactive Auggie agent shell.                                      |
 |                 | agent-shell-clear-buffer                                | Clear the current shell buffer.                                               |
 |                 | agent-shell-completion-mode                             | Toggle agent shell completion with @ or / prefix.                             |
@@ -1070,6 +1170,7 @@ always go to Evil modes if you need to with ~C-z~).
 |                 | agent-shell-prompt-queue                                | Queue or immediately send a prompt depending on shell busy state.             |
 |                 | agent-shell-prompt-queue-remove                         | Remove all pending prompts or a specific prompt by REMOVE-INDEX.              |
 |                 | agent-shell-prompt-queue-resume                         | Resume processing pending prompts in the queue.                               |
+|                 | agent-shell-prompt-steer                                | Steer PROMPT into the turn the agent is currently running.                    |
 | r               | agent-shell-quote-region                                | Quote the active region into the shell's latest prompt.                       |
 |                 | agent-shell-qwen-start                                  | Start an interactive Qwen Code CLI agent shell.                               |
 | C-x x r         | agent-shell-rename-buffer                               | Rename current shell buffer.                                                  |

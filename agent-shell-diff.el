@@ -145,7 +145,6 @@ Arguments:
                 ;; Hide --- and +++ lines
                 (while (re-search-forward "^\\(---\\|\\+\\+\\+\\).*\n" nil t)
                   (let ((overlay (make-overlay (match-beginning 0) (match-end 0))))
-                    (overlay-put overlay 'category 'diff-header)
                     (overlay-put overlay 'display "")
                     (overlay-put overlay 'evaporate t)))
                 ;; Replace @@ lines with a single-line "changes" label.
@@ -187,7 +186,6 @@ Arguments:
                       (goto-char (min (point-max) (1+ end)))
                       (insert (propertize "\n" 'agent-shell-diff-spacer t)))
                     (let ((overlay (make-overlay beg end)))
-                      (overlay-put overlay 'category 'diff-header)
                       (overlay-put overlay 'display
                                    (propertize " changes " 'face 'agent-shell-diff-changes-label))
                       (overlay-put overlay 'evaporate t))))))

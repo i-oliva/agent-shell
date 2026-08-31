@@ -55,6 +55,7 @@
 (require 'agent-shell-artist)
 (require 'agent-shell-faces)
 (require 'agent-shell-markdown)
+(require 'agent-shell-antigravity)
 (require 'agent-shell-anthropic)
 (require 'agent-shell-auggie)
 (require 'agent-shell-chat-mode)
@@ -767,7 +768,8 @@ reloads.
 This is the default value of `agent-shell-agent-configs'.  It is exposed
 so a function value for that variable can build on the defaults, for
 example filtering them.  See `agent-shell-agent-configs'."
-  (list #'agent-shell-auggie-make-agent-config
+  (list #'agent-shell-antigravity-make-agent-config
+        #'agent-shell-auggie-make-agent-config
         #'agent-shell-anthropic-make-claude-code-config
         #'agent-shell-codebuddy-make-agent-config
         #'agent-shell-cline-make-agent-config
@@ -853,6 +855,7 @@ wrap the identifier in a cons cell:
 The equivalent `(auto . claude-code)' spells out the unconditional
 behavior explicitly."
   :type '(choice (const :tag "None (prompt each time)" nil)
+                 (const :tag "Antigravity" antigravity)
                  (const :tag "Auggie" auggie)
                  (const :tag "Claude Code" claude-code)
                  (const :tag "CodeBuddy" codebuddy)
@@ -1209,6 +1212,7 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
         (cons :supports-session-load nil)
         (cons :supports-session-resume nil)
         (cons :supports-session-fork nil)
+        (cons :supports-steering nil)
         (cons :resume-session-id nil)
         (cons :fork-session-id nil)
         (cons :pending-restore nil)
@@ -2035,6 +2039,16 @@ Returns one of:
       (if (shell-maker-busy)
           'busy
         'ready)))))
+
+(cl-defun agent-shell-steering-supported-p (&key shell-buffer)
+  "Return non-nil when the agent accepts a prompt steered into a running turn.
+When SHELL-BUFFER is non-nil, check that buffer instead of the current one.
+
+Steering is an ACP extension rather than part of the spec, so the agent
+advertises it in the `initialize' response's top-level `_meta' as
+`steering.supported'.  See `agent-shell-experimental--send-steering'."
+  (with-current-buffer (or shell-buffer (current-buffer))
+    (map-elt agent-shell--state :supports-steering)))
 
 (defun agent-shell-interrupt (&optional force)
   "Interrupt in-progress request and reject all pending permissions.
@@ -3008,7 +3022,7 @@ Clears STATE's `:expanded-activity-group'."
                           (concat (propertize
                                    (map-nested-elt
                                     state '(:agent-config :shell-prompt))
-                                   'font-lock-face 'agent-shell-prompt
+                                   'font-lock-face '(agent-shell-prompt comint-highlight-prompt)
                                    'field 'output)
                                   (propertize content-text
                                               'font-lock-face 'agent-shell-input))
@@ -6406,6 +6420,11 @@ Must provide ON-INITIATED (lambda ())."
                                                               (:name . ,(map-elt mode 'name))
                                                               (:description . ,(map-elt mode 'description))))
                                                           (map-elt modes 'availableModes))))))
+                   ;; Steering is an extension, so it is advertised in the
+                   ;; response's top-level `_meta' rather than in
+                   ;; `agentCapabilities'.  See `agent-shell-steering-supported-p'.
+                   (map-put! agent-shell--state :supports-steering
+                             (eq (map-nested-elt acp-response '(_meta steering supported)) t))
                    (when-let* ((agent-capabilities (map-elt acp-response 'agentCapabilities)))
                      (map-put! agent-shell--state :supports-session-load
                                (eq (map-elt agent-capabilities 'loadSession) t))
@@ -6413,7 +6432,13 @@ Must provide ON-INITIATED (lambda ())."
                       :state agent-shell--state
                       :block-id "agent_capabilities"
                       :label-left (propertize "Agent capabilities" 'font-lock-face 'agent-shell-section-heading)
-                      :body (agent-shell--format-agent-capabilities agent-capabilities)))
+                      ;; Listed alongside the spec capabilities because that is
+                      ;; what it is to a reader of this block, even though the
+                      ;; wire carries it elsewhere.
+                      :body (agent-shell--format-agent-capabilities
+                             (if (map-elt agent-shell--state :supports-steering)
+                                 (append agent-capabilities '((steering . t)))
+                               agent-capabilities))))
                    (agent-shell--emit-event :event 'init-handshake))
                  (funcall on-initiated))
    :on-failure (agent-shell--make-error-handler
@@ -7954,16 +7979,26 @@ Each marked span is replaced by its `agent-shell-region-text' value."
           (insert full-text))))
     (buffer-string)))
 
+(cl-defun agent-shell--prompt-content-blocks (prompt)
+  "Return PROMPT as content blocks, showing whatever files it attaches.
+
+Falls back to a lone text block when PROMPT cannot be parsed, so a
+malformed mention costs the mention rather than the whole prompt.
+
+Must be called from the shell buffer: `agent-shell--build-content-blocks'
+reads the buffer's prompt capabilities."
+  (let ((content-blocks (condition-case nil
+                            (agent-shell--build-content-blocks prompt)
+                          (error `[((type . "text")
+                                    (text . ,(substring-no-properties prompt)))]))))
+    (when-let* ((attached-files (agent-shell--collect-attached-files content-blocks)))
+      (agent-shell--display-attached-files attached-files))
+    content-blocks))
+
 (cl-defun agent-shell--send-command (&key prompt shell-buffer)
   "Send PROMPT to agent using SHELL-BUFFER."
   (let* ((expanded-prompt (agent-shell--expand-truncated-regions prompt))
-         (content-blocks (condition-case nil
-                             (agent-shell--build-content-blocks expanded-prompt)
-                           (error `[((type . "text")
-                                     (text . ,(substring-no-properties expanded-prompt)))])))
-         (attached-files (agent-shell--collect-attached-files content-blocks)))
-    (when attached-files
-      (agent-shell--display-attached-files attached-files))
+         (content-blocks (agent-shell--prompt-content-blocks expanded-prompt)))
     (when agent-shell-show-busy-indicator
       (agent-shell-heartbeat-start
        :heartbeat (map-elt agent-shell--state :heartbeat)))
