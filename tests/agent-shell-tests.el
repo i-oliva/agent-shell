@@ -1514,6 +1514,236 @@ the category, the option is still returned."
     (should (equal (map-elt (agent-shell--config-option-by-category state "model") :id)
                    "model_id"))))
 
+(ert-deftest agent-shell--shell-response-start-ignores-quoted-marker-test ()
+  "The response starts at shell-maker's own delimiter, not at a quoted one.
+An agent asked about `<shell-maker-end-of-prompt>' writes those
+characters back without the `shell-maker--marker' property, and reading
+them as the delimiter would report the response starting mid-sentence."
+  (with-temp-buffer
+    (insert "Claude> ask\nplain <shell-maker-end-of-prompt> text\n")
+    (cl-letf (((symbol-function 'shell-maker--prompt-begin-position)
+               (lambda () (point-min))))
+      (should-not (agent-shell--shell-response-start))))
+  (with-temp-buffer
+    (insert "Claude> ask\n"
+            (propertize "<shell-maker-end-of-prompt>" 'shell-maker--marker t)
+            "\nthe reply\n")
+    (cl-letf (((symbol-function 'shell-maker--prompt-begin-position)
+               (lambda () (point-min))))
+      (should (equal "\nthe reply\n"
+                     (buffer-substring-no-properties
+                      (agent-shell--shell-response-start) (point-max)))))))
+
+(defun agent-shell-tests--opencode-config-options-state ()
+  "Return state advertising the config options OpenCode reports over ACP.
+
+Its thought level option is `effort', categorized \"thought_level\", and
+its \"fast\" option carries no category at all."
+  (list (cons :config-options
+              (agent-shell--normalize-config-options
+               [((id . "model")
+                 (name . "Model")
+                 (category . "model")
+                 (type . "select")
+                 (currentValue . "anthropic/claude-opus-4-5")
+                 (options . [((value . "anthropic/claude-opus-4-5")
+                              (name . "Claude Opus 4.5"))]))
+                ((id . "effort")
+                 (name . "Effort")
+                 (category . "thought_level")
+                 (type . "select")
+                 (currentValue . "low")
+                 (options . [((value . "low") (name . "Low"))
+                             ((value . "high") (name . "High"))
+                             ((value . "max") (name . "Max"))]))
+                ((id . "fast")
+                 (name . "Fast mode")
+                 (type . "select")
+                 (currentValue . "off")
+                 (options . [((value . "on") (name . "On"))
+                             ((value . "off") (name . "Off"))]))]))))
+
+(ert-deftest agent-shell--resolve-config-option-by-id-test ()
+  "Test `agent-shell--resolve-config-option' matches advertised ids.
+
+Ids are what a shell lists under \"Available config options\", and are
+the only way to reach an option carrying no ACP category."
+  (let ((state (agent-shell-tests--opencode-config-options-state)))
+    (should (equal (map-elt (agent-shell--resolve-config-option state "effort") :id)
+                   "effort"))
+    (should (equal (map-elt (agent-shell--resolve-config-option state "fast") :id)
+                   "fast"))
+    (should-not (agent-shell--resolve-config-option state "nonexistent"))))
+
+(ert-deftest agent-shell--resolve-config-option-by-category-test ()
+  "Test `agent-shell--resolve-config-option' falls back to ACP categories.
+
+OpenCode names its thought level option `effort', so the spec's
+\"thought_level\" category has to resolve to it."
+  (let ((state (agent-shell-tests--opencode-config-options-state)))
+    (should (equal (map-elt (agent-shell--resolve-config-option state "thought_level") :id)
+                   "effort"))
+    (should (equal (map-elt (agent-shell--resolve-config-option state "model") :id)
+                   "model"))))
+
+(ert-deftest agent-shell--default-config-option-values-test ()
+  "Test `agent-shell--default-config-option-values'."
+  (let ((state (agent-shell-tests--opencode-config-options-state)))
+    (should (equal (agent-shell--default-config-option-values state "effort")
+                   '("low" "high" "max")))
+    (should (equal (agent-shell--default-config-option-values state "thought_level")
+                   '("low" "high" "max")))
+    (should (equal (agent-shell--default-config-option-values state "model")
+                   '("anthropic/claude-opus-4-5")))
+    (should-not (agent-shell--default-config-option-values state "reasoning"))))
+
+(ert-deftest agent-shell--default-config-option-settable-test ()
+  "Test `agent-shell--default-config-option-settable-p'."
+  (let ((state (agent-shell-tests--opencode-config-options-state)))
+    (should (agent-shell--default-config-option-settable-p state "effort" "high"))
+    (should-not (agent-shell--default-config-option-settable-p state "effort" "turbo"))
+    (should-not (agent-shell--default-config-option-settable-p state "reasoning" "high")))
+  ;; "model" and "mode" stay settable with no config options advertised,
+  ;; since the legacy requests still reach the agent.
+  (let ((state (list (cons :session (list (cons :id "session-1"))))))
+    (should (agent-shell--default-config-option-settable-p state "model" "gpt-5.5"))
+    (should (agent-shell--default-config-option-settable-p state "mode" "plan"))
+    (should-not (agent-shell--default-config-option-settable-p state "effort" "high"))))
+
+(ert-deftest agent-shell--default-config-option-skip-reason-test ()
+  "Test `agent-shell--default-config-option-skip-reason'."
+  (let ((state (agent-shell-tests--opencode-config-options-state)))
+    (should (equal (agent-shell--default-config-option-skip-reason state "effort")
+                   "agent offers low, high, max"))
+    (should (equal (agent-shell--default-config-option-skip-reason state "reasoning")
+                   "agent advertises no reasoning option"))))
+
+(ert-deftest agent-shell--set-default-config-option-legacy-model-test ()
+  "Test a \"model\" entry falls back to the legacy ACP model request.
+
+An agent advertising no config options still answers
+`session/set_model', so `agent-shell--set-default-config-options' has
+to reach it the same way `:default-model-id' does."
+  (let ((sent-request nil)
+        (finished nil))
+    (with-temp-buffer
+      (setq-local agent-shell--state
+                  (list (cons :buffer (current-buffer))
+                        (cons :client 'test-client)
+                        (cons :session (list (cons :id "session-1")
+                                             (cons :model-id "gpt-5")
+                                             (cons :models '(((:model-id . "gpt-5"))
+                                                             ((:model-id . "gpt-5.5"))))))))
+      (cl-letf (((symbol-function 'agent-shell--state)
+                 (lambda () agent-shell--state))
+                ((symbol-function 'agent-shell--update-bootstrapping-fragment)
+                 (lambda (&rest _)))
+                ((symbol-function 'agent-shell--update-header-and-mode-line)
+                 #'ignore)
+                ((symbol-function 'agent-shell--emit-event)
+                 (lambda (&rest _)))
+                ((symbol-function 'agent-shell--send-request)
+                 (lambda (&rest args)
+                   (setq sent-request (plist-get args :request))
+                   (funcall (plist-get args :on-success) nil))))
+        (agent-shell--set-default-config-options
+         :shell-buffer (current-buffer)
+         :config-options '(("model" . "gpt-5.5"))
+         :on-options-set (lambda () (setq finished t)))))
+    (should (equal (map-elt sent-request :method) "session/set_model"))
+    (should (equal (map-nested-elt sent-request '(:params modelId)) "gpt-5.5"))
+    (should finished)))
+
+(ert-deftest agent-shell--set-default-config-option-sibling-category-test ()
+  "Test an entry naming a sibling of \"model\" is not routed as the model.
+
+Cline tags both its `provider' and `model' options with category
+\"model\", so routing on the resolved option's category would send a
+`provider' entry to the model setter, which resolves category
+\"model\" back to the model option."
+  (let ((sent nil))
+    (with-temp-buffer
+      (setq-local agent-shell--state
+                  (list (cons :buffer (current-buffer))
+                        (cons :session (list (cons :id "session-1")))
+                        (cons :config-options
+                              (agent-shell--normalize-config-options
+                               [((id . "provider")
+                                 (name . "Provider")
+                                 (category . "model")
+                                 (type . "select")
+                                 (currentValue . "openai-codex")
+                                 (options . [((value . "cline") (name . "Cline"))
+                                             ((value . "openai-codex") (name . "Codex"))]))
+                                ((id . "model")
+                                 (name . "Model")
+                                 (category . "model")
+                                 (type . "select")
+                                 (currentValue . "gpt-5.5")
+                                 (options . [((value . "gpt-5.5") (name . "GPT-5.5"))]))]))))
+      (cl-letf (((symbol-function 'agent-shell--state)
+                 (lambda () agent-shell--state))
+                ((symbol-function 'agent-shell--update-bootstrapping-fragment)
+                 (lambda (&rest _)))
+                ((symbol-function 'agent-shell--emit-event)
+                 (lambda (&rest _)))
+                ((symbol-function 'agent-shell--set-session-config-option)
+                 (lambda (&rest args)
+                   (push (cons (plist-get args :config-id)
+                               (plist-get args :value))
+                         sent)
+                   (funcall (plist-get args :on-success)))))
+        (agent-shell--set-default-config-options
+         :shell-buffer (current-buffer)
+         :config-options '(("provider" . "cline")
+                           ("model" . "gpt-5.5"))
+         :on-options-set #'ignore)))
+    (should (equal (reverse sent)
+                   '(("provider" . "cline")
+                     ("model" . "gpt-5.5"))))))
+
+(ert-deftest agent-shell--set-default-config-options-test ()
+  "Test `agent-shell--set-default-config-options' applies options in order.
+
+Entries resolve by id or category, are sent one at a time in the order
+listed, and anything the agent does not offer is skipped without
+stalling the rest of initialization."
+  (let ((sent nil)
+        (finished nil))
+    (with-temp-buffer
+      (setq-local agent-shell--state
+                  (append (list (cons :buffer (current-buffer))
+                                (cons :session (list (cons :id "session-1"))))
+                          (agent-shell-tests--opencode-config-options-state)))
+      (cl-letf (((symbol-function 'agent-shell--state)
+                 (lambda () agent-shell--state))
+                ((symbol-function 'agent-shell--update-bootstrapping-fragment)
+                 (lambda (&rest _)))
+                ((symbol-function 'agent-shell--emit-event)
+                 (lambda (&rest _)))
+                ((symbol-function 'agent-shell--set-session-config-option)
+                 (lambda (&rest args)
+                   (push (cons (plist-get args :config-id)
+                               (plist-get args :value))
+                         sent)
+                   (funcall (plist-get args :on-success)))))
+        (agent-shell--set-default-config-options
+         :shell-buffer (current-buffer)
+         :config-options '(("model" . "anthropic/claude-opus-4-5")
+                           ("thought_level" . "high")
+                           ("fast" . "on")
+                           ("reasoning" . "high")
+                           ("effort" . "turbo"))
+         :on-options-set (lambda () (setq finished t)))))
+    ;; "thought_level" resolves to the "effort" id OpenCode advertises,
+    ;; while the unadvertised "reasoning" option and the "turbo" value
+    ;; "effort" does not offer are both skipped.
+    (should (equal (reverse sent)
+                   '(("model" . "anthropic/claude-opus-4-5")
+                     ("effort" . "high")
+                     ("fast" . "on"))))
+    (should finished)))
+
 (ert-deftest agent-shell--session-from-response-config-options-test ()
   "Test `agent-shell--session-from-response' stores config options."
   (let ((session (agent-shell--session-from-response
@@ -4195,21 +4425,69 @@ and it must handle that cleanly."
           (remove-hook 'kill-buffer-hook #'agent-shell--clean-up t))
         (kill-buffer shell-buf)))))
 
-(ert-deftest agent-shell-filter-buffer-substring-strips-hidden-markup ()
-  "Copying text should exclude markdown syntax hidden by overlays."
+(ert-deftest agent-shell-filter-buffer-substring-copies-rendered-text ()
+  "Copying yields the rendered text the in-place renderer left behind.
+`agent-shell-markdown-replace-markup' removes markup as it renders, so
+the copy path has nothing left to strip."
   (with-temp-buffer
-    (insert "```emacs-lisp\n(defun foo (x)\n  x)\n```\n")
-    (markdown-overlays-put)
-    (let ((result (agent-shell--filter-buffer-substring (point-min) (point-max))))
-      (should (equal result "(defun foo (x)\n  x)\n\n")))))
+    (insert "Use `foo-bar` and **bold** here.")
+    (agent-shell-markdown-replace-markup :complete t)
+    (should (equal (agent-shell--filter-buffer-substring (point-min) (point-max))
+                   "Use foo-bar and bold here."))))
 
-(ert-deftest agent-shell-filter-buffer-substring-strips-inline-code-backticks ()
-  "Copying inline code should exclude the surrounding backticks."
+(ert-deftest agent-shell-filter-buffer-substring-drops-properties ()
+  "Copying drops every property, so a paste gives plain characters.
+Covers the chrome a shell buffer layers on: faces, indent
+prefixes that would re-indent the text, mouse pointers, and the UI's own
+markers."
   (with-temp-buffer
-    (insert "Use `foo-bar` for that.")
-    (markdown-overlays-put)
-    (let ((result (agent-shell--filter-buffer-substring (point-min) (point-max))))
-      (should (equal result "Use foo-bar for that.")))))
+    (insert (propertize "rendered output"
+                        'face 'font-lock-keyword-face
+                        'line-prefix "    "
+                        'wrap-prefix "    "
+                        'pointer 'hand
+                        'agent-shell-ui-section 'label-left))
+    (let ((copied (agent-shell--filter-buffer-substring (point-min) (point-max)))
+          (pos 0))
+      (should (equal copied "rendered output"))
+      (while (< pos (length copied))
+        (should-not (text-properties-at pos copied))
+        (setq pos (1+ pos))))))
+
+(ert-deftest agent-shell-filter-buffer-substring-strips-block-quote-prefix ()
+  "Copying quoted text drops the \"> \" `agent-shell--block-quote' added."
+  (with-temp-buffer
+    (insert (agent-shell--block-quote "hello\nworld"))
+    (should (equal (agent-shell--filter-buffer-substring (point-min) (point-max))
+                   "hello\nworld"))))
+
+(ert-deftest agent-shell-filter-buffer-substring-strips-one-quote-level ()
+  "Quoting already-quoted text keeps the inner \"> \" on copy."
+  (with-temp-buffer
+    (insert (agent-shell--block-quote "> hello"))
+    (should (equal (agent-shell--filter-buffer-substring (point-min) (point-max))
+                   "> hello"))))
+
+(ert-deftest agent-shell-filter-buffer-substring-keeps-rendered-block-quote ()
+  "Markdown blockquotes copy with their \"> \" so the source round-trips."
+  (with-temp-buffer
+    (insert "> hello\n")
+    (agent-shell-markdown-replace-markup)
+    (should (equal (agent-shell--filter-buffer-substring (point-min) (point-max))
+                   "> hello\n"))))
+
+(ert-deftest agent-shell-filter-buffer-substring-block-quote-copies-alike ()
+  "A quoted reply copies the same whatever consumes it.
+The `yank-handler' this replaced rewrote text for `yank' only, so the
+system clipboard and isearch kept a \"> \" that `C-y' dropped."
+  (with-temp-buffer
+    (insert (agent-shell--block-quote "hello"))
+    (let ((copied (agent-shell--filter-buffer-substring (point-min) (point-max))))
+      (should (equal copied "hello"))
+      (should (equal (with-temp-buffer
+                       (insert-for-yank copied)
+                       (buffer-substring-no-properties (point-min) (point-max)))
+                     copied)))))
 
 (ert-deftest agent-shell-filter-buffer-substring-handles-reversed-range ()
   "A reversed range yields the same text as the forward one.
@@ -4224,6 +4502,128 @@ direction."
           (reversed (agent-shell--filter-buffer-substring (point-max) (point-min))))
       (should (equal forward "hello world"))
       (should (equal reversed forward)))))
+
+(ert-deftest agent-shell-filter-buffer-substring-expands-fold-indicators ()
+  "Copying a collapsed section points its fold indicator down.
+The hidden body is copied too, so a `▶' would claim the copy hides
+content it actually carries."
+  (with-temp-buffer
+    (insert "▶ Thought\n")
+    (put-text-property (point-min) (+ (point-min) 2)
+                       'agent-shell-ui-section 'indicator)
+    (let ((body-start (point)))
+      (insert "So the user wants...")
+      (put-text-property body-start (point) 'invisible t))
+    (should (equal (agent-shell--filter-buffer-substring (point-min) (point-max))
+                   "▼ Thought\nSo the user wants..."))))
+
+(ert-deftest agent-shell-filter-buffer-substring-expands-rendered-fragment ()
+  "A really rendered collapsed fragment copies the same as an expanded one.
+Guards the render path rather than hand-placed properties: a rendered
+indicator also carries `read-only', which travels with the copied text
+and blocks a naive substitution."
+  (let ((collapsed (with-temp-buffer
+                     (agent-shell-ui-mode 1)
+                     (agent-shell-ui-update-fragment
+                      (agent-shell-ui-make-fragment-model
+                       :namespace-id "ns" :block-id "1"
+                       :label-left "Thought" :body "So the user wants...")
+                      :expanded nil :navigation 'always)
+                     (agent-shell--filter-buffer-substring (point-min) (point-max))))
+        (expanded (with-temp-buffer
+                    (agent-shell-ui-mode 1)
+                    (agent-shell-ui-update-fragment
+                     (agent-shell-ui-make-fragment-model
+                      :namespace-id "ns" :block-id "1"
+                      :label-left "Thought" :body "So the user wants...")
+                     :expanded t :navigation 'always)
+                    (agent-shell--filter-buffer-substring (point-min) (point-max)))))
+    (should (string-match-p "▼ Thought" collapsed))
+    (should (string-match-p "So the user wants\\.\\.\\." collapsed))
+    (should (equal collapsed expanded))))
+
+(ert-deftest agent-shell-filter-buffer-substring-keeps-agent-authored-triangles ()
+  "Copying leaves a `▶' the agent wrote in its response alone.
+Only glyphs the UI tagged as fold indicators are rewritten."
+  (with-temp-buffer
+    (insert "Press ▶ to play.")
+    (should (equal (agent-shell--filter-buffer-substring (point-min) (point-max))
+                   "Press ▶ to play."))))
+
+(defvar agent-shell-tests--marked-from nil
+  "Point at which the stubbed `shell-maker-mark-output' last ran.")
+
+(defmacro agent-shell-tests--with-fake-output (prompt-pos &rest body)
+  "Run BODY in a fake shell buffer whose process mark sits at PROMPT-POS.
+
+Stubs the shell's process so `agent-shell-copy-last-output' can locate
+the latest prompt, and stubs `shell-maker-mark-output' to mark from
+point to `point-max', recording where point was when it ran in
+`agent-shell-tests--marked-from'."
+  (declare (indent 1) (debug t))
+  `(cl-letf (((symbol-function 'get-buffer-process)
+              (lambda (_buffer) 'fake-process))
+             ((symbol-function 'process-mark)
+              (lambda (_process) (copy-marker ,prompt-pos)))
+             ((symbol-function 'shell-maker-mark-output)
+              (lambda ()
+                (setq agent-shell-tests--marked-from (point))
+                (set-mark (point-max)))))
+     ,@body))
+
+(ert-deftest agent-shell-copy-last-output-copies-through-filter ()
+  "Copying the last output routes through agent-shell's copy filter.
+Asserted via a fold indicator, which the filter rewrites, so this holds
+whichever markdown renderer is in use."
+  (with-temp-buffer
+    (setq major-mode 'agent-shell-mode)
+    (setq-local filter-buffer-substring-function #'agent-shell--filter-buffer-substring)
+    (insert "▶ Thought\n")
+    (put-text-property (point-min) (+ (point-min) 2)
+                       'agent-shell-ui-section 'indicator)
+    (insert "So the user wants...")
+    (agent-shell-tests--with-fake-output (point-min)
+      (agent-shell-copy-last-output))
+    (should (equal (current-kill 0) "▼ Thought\nSo the user wants..."))))
+
+(ert-deftest agent-shell-copy-last-output-ignores-point ()
+  "Copying the last output starts from the latest prompt, not from point.
+Scrolling back to read an earlier response must not change which output
+this command copies."
+  (with-temp-buffer
+    (setq major-mode 'agent-shell-mode)
+    (insert "old output\nlatest output")
+    (goto-char 3)
+    (agent-shell-tests--with-fake-output 12
+      (agent-shell-copy-last-output))
+    (should (equal agent-shell-tests--marked-from 12))
+    (should (equal (current-kill 0) "latest output"))))
+
+(ert-deftest agent-shell-copy-last-output-restores-point-and-mark ()
+  "Copying the last output leaves point put and the mark inactive.
+Marking the output is an implementation detail of the copy, so it must
+not disturb the region the user had (or did not have) selected."
+  (with-temp-buffer
+    (setq major-mode 'agent-shell-mode)
+    (insert "hello world")
+    (goto-char 3)
+    (agent-shell-tests--with-fake-output (point-min)
+      (agent-shell-copy-last-output))
+    (should (equal (point) 3))
+    (should-not mark-active)))
+
+(ert-deftest agent-shell-copy-last-output-outside-shell-errors ()
+  "Copying the last output outside a shell reports a `user-error'."
+  (with-temp-buffer
+    (text-mode)
+    (should-error (agent-shell-copy-last-output) :type 'user-error)))
+
+(ert-deftest agent-shell-copy-last-output-without-process-errors ()
+  "Copying the last output in a shell with no process reports a `user-error'."
+  (with-temp-buffer
+    (setq major-mode 'agent-shell-mode)
+    (insert "output")
+    (should-error (agent-shell-copy-last-output) :type 'user-error)))
 
 (ert-deftest agent-shell-trim-strips-untagged-whitespace ()
   ;; Plain `string-trim'-style behavior when nothing is tagged: outer
@@ -4589,8 +4989,6 @@ interaction (e.g. \"1/2\" after switching to the latest interaction)."
                      (lambda (&rest _) shell-buffer))
                     ((symbol-function 'shell-maker-history-position)
                      (lambda () '((:current . 2) (:total . 2))))
-                    ((symbol-function 'markdown-overlays-put)
-                     (lambda (&rest _) nil))
                     ((symbol-function 'agent-shell-viewport--update-header)
                      (lambda ()
                        (setq rendered-position (agent-shell-viewport--position)))))
@@ -4598,6 +4996,28 @@ interaction (e.g. \"1/2\" after switching to the latest interaction)."
             (should (equal rendered-position '((:current . 2) (:total . 2))))))
       (kill-buffer viewport-buffer)
       (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell-viewport--initialize-overrides-prompt-font-lock-face-test ()
+  "The echoed viewport prompt must override copied input font-lock faces."
+  (let ((agent-shell-header-style 'text)
+        (agent-shell-file-completion-enabled nil)
+        (prompt (propertize "Claude> inspect"
+                            'font-lock-face 'comint-highlight-input)))
+    (with-temp-buffer
+      (let ((viewport-buffer (current-buffer)))
+        (cl-letf (((symbol-function 'agent-shell-viewport--position)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'agent-shell-viewport--shell-buffer)
+                   (lambda (&rest _) viewport-buffer))
+                  ((symbol-function 'agent-shell-viewport--update-header)
+                   (lambda (&rest _))))
+          (agent-shell-viewport-view-mode)
+          (agent-shell-viewport--initialize :prompt prompt)
+          (let ((prompt-start (agent-shell-viewport--prompt-start)))
+            (should (eq (get-text-property prompt-start 'face)
+                        'agent-shell-viewport-prompt))
+            (should (eq (get-text-property prompt-start 'font-lock-face)
+                        'agent-shell-viewport-prompt))))))))
 
 (ert-deftest agent-shell--refresh-session-title-skips-when-list-unsupported ()
   "Test `agent-shell--refresh-session-title' sends no request without `list'.
@@ -5280,6 +5700,56 @@ prompt and the prompt end sits past the accessible `point-max'."
           (narrow-to-region (point-min) (marker-position prompt-start))
           ;; Must not raise `Args out of range' and must report not-live.
           (should-not (agent-shell--live-input-prompt-p prompt)))))))
+
+(ert-deftest agent-shell--make-error-handler-keeps-live-prompt-test ()
+  "An error arriving out of turn must not print a second prompt.
+
+The shell shows a prompt from creation onward, so an error while the
+shell is idle (bootstrapping failed, or an out of turn error) already
+has a prompt to type into.  Printing another stacks two prompts and
+comint strips the highlight off the first one."
+  (let ((shell-buf (generate-new-buffer " *test-shell*"))
+        (finished 0))
+    (unwind-protect
+        (with-current-buffer shell-buf
+          (comint-mode)
+          (setq major-mode 'agent-shell-mode)
+          (setq-local agent-shell--state
+                      (agent-shell--make-state :buffer shell-buf))
+          (insert "output\n")
+          (let ((prompt-start (copy-marker (point) nil)))
+            (insert "> ")
+            (setq-local comint-last-prompt
+                        (cons prompt-start (copy-marker (point) nil))))
+          (cl-letf (((symbol-function 'agent-shell--update-fragment)
+                     (lambda (&rest _)))
+                    ((symbol-function 'agent-shell-heartbeat-stop)
+                     (lambda (&rest _)))
+                    ((symbol-function 'shell-maker-finish-output)
+                     (lambda (&rest _) (setq finished (1+ finished)))))
+            ;; Idle shell with a live prompt: no new prompt printed.
+            (cl-letf (((symbol-function 'shell-maker-busy) (lambda (&rest _) nil)))
+              (funcall (agent-shell--make-error-handler
+                        :state (agent-shell--state) :shell-buffer shell-buf)
+                       '((code . -32603) (message . "Internal error")) "raw")
+              (should (equal finished 0)))
+            ;; A turn was in flight: its prompt must be reprinted.
+            (cl-letf (((symbol-function 'shell-maker-busy) (lambda (&rest _) t)))
+              (funcall (agent-shell--make-error-handler
+                        :state (agent-shell--state) :shell-buffer shell-buf)
+                       '((code . -32603) (message . "Internal error")) "raw")
+              (should (equal finished 1)))
+            ;; Idle, but output streamed below the prompt left it stale.
+            (cl-letf (((symbol-function 'shell-maker-busy) (lambda (&rest _) nil)))
+              (let ((out-start (point-max)))
+                (goto-char out-start)
+                (insert "streamed")
+                (put-text-property out-start (point) 'field 'output))
+              (funcall (agent-shell--make-error-handler
+                        :state (agent-shell--state) :shell-buffer shell-buf)
+                       '((code . -32603) (message . "Internal error")) "raw")
+              (should (equal finished 2)))))
+      (kill-buffer shell-buf))))
 
 (ert-deftest agent-shell--realign-on-change-schedules-regardless-of-width ()
   "Schedule a re-align on every window change, not just width changes.

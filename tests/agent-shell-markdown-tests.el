@@ -3594,22 +3594,6 @@ A " nil)
     (should (string-match-p "^hello\nworld\n$"
                             (substring-no-properties (buffer-string))))))
 
-(ert-deftest agent-shell-markdown-yank-strips-properties ()
-  ;; Rendered chars carry a `yank-handler' that strips every text
-  ;; property on paste — display overrides, internal markers, faces,
-  ;; keymaps — so a copy/paste into another buffer gives plain chars,
-  ;; not our implementation cruft.
-  (with-temp-buffer
-    (insert "**bold** and `code`\n")
-    (agent-shell-markdown-replace-markup)
-    (kill-new (buffer-substring (point-min) (point-max))))
-  (with-temp-buffer
-    (yank)
-    (let ((pos (point-min)))
-      (while (< pos (point-max))
-        (should-not (text-properties-at pos))
-        (setq pos (1+ pos))))))
-
 (ert-deftest agent-shell-markdown-convert-blockquote-single-level ()
   ;; `> text\n' keeps the `>' in the buffer (source round-trips) but
   ;; shows `▌' as a display override.  The line content carries the
@@ -4132,6 +4116,7 @@ leave point somewhere the user can't see rather than fail."
 Text/navigable files open in Emacs; binary files open externally."
   (let ((text (make-temp-file "agent-shell-ol-text" nil ".txt"))
         (binary (make-temp-file "agent-shell-ol-bin" nil ".bin"))
+        (dir (make-temp-file "agent-shell-ol-dir" t))
         (action nil))
     (unwind-protect
         (progn
@@ -4146,6 +4131,12 @@ Text/navigable files open in Emacs; binary files open externally."
                    (lambda (path) (setq action (cons 'in-emacs path)) nil)))
               (should (agent-shell-markdown--open-local-link (concat "file://" text))))
             (should (equal action (cons 'in-emacs text)))
+            ;; Directory -> opened in Emacs (e.g. dired), however the opener displays it.
+            (setq action nil)
+            (let ((agent-shell-markdown-open-file-function
+                   (lambda (path) (setq action (cons 'in-emacs path)) nil)))
+              (should (agent-shell-markdown--open-local-link (concat "file://" dir))))
+            (should (equal action (cons 'in-emacs dir)))
             ;; Binary file -> open externally.
             (setq action nil)
             (should (agent-shell-markdown--open-local-link (concat "file://" binary)))
@@ -4155,7 +4146,8 @@ Text/navigable files open in Emacs; binary files open externally."
             (should (agent-shell-markdown--open-local-link (concat "file://" binary "#L10")))
             (should (equal action (cons 'external binary)))))
       (delete-file text)
-      (delete-file binary))))
+      (delete-file binary)
+      (delete-directory dir))))
 
 (ert-deftest agent-shell-markdown--parse-local-link-lines-test ()
   "Test `agent-shell-markdown--parse-local-link' reads lines and ranges.

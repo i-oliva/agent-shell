@@ -36,7 +36,7 @@ no newline above to carry it."
       (overlay-get me 'before-string)))
 
 (defun agent-shell-chat-mode-tests--marker-string (me)
-  "Return the string carrying ME\='s prompt marker.
+  "Return the string carrying ME\\='s prompt marker.
 It travels as the covered prompt's `display' (standing on its buffer
 positions, adding none) where the label rides the newline above; with no
 newline to ride, the label renders on ME itself and the marker rejoins it
@@ -52,6 +52,12 @@ there."
                       (eq (overlay-get overlay 'agent-shell-chat--tag) 'me))
                     (overlays-in (point-min) (point-max)))
         (lambda (a b) (< (overlay-start a) (overlay-start b)))))
+
+(defun agent-shell-chat-mode-tests--draft-overlay ()
+  "Return the overlay indenting the live prompt's draft, or nil."
+  (seq-find (lambda (overlay)
+              (eq (overlay-get overlay 'agent-shell-chat--tag) 'me-draft))
+            (overlays-in (point-min) (point-max))))
 
 (defun agent-shell-chat-mode-tests--agent-overlays ()
   "Return the agent label overlays in the current buffer."
@@ -307,7 +313,7 @@ would render two blank lines instead of one."
 A string there holds point and the cursor on the row above, so moving up
 into an input spanning several lines lands above the input rather than on
 its first line.  The label rides the newline above instead, and the marker
-travels as a `line-prefix\\='; neither occupies a buffer position, leaving
+travels as a `line-prefix'; neither occupies a buffer position, leaving
 the input reachable."
   (agent-shell-chat-mode-tests--with-shell
     (agent-shell-chat-mode-tests--prompt "Claude> ")
@@ -326,17 +332,17 @@ the input reachable."
       (should (eq ?\n (char-before (overlay-start me)))))))
 
 (ert-deftest agent-shell-chat-live-prompt-marker-not-line-prefix-test ()
-  "The live prompt's marker is a `display\=', never a `line-prefix\='.
+  "The live prompt's marker is a `display', never a `line-prefix'.
 
-A `line-prefix\=' belongs to the whole line, and the input's first line
+A `line-prefix' belongs to the whole line, and the input's first line
 shares its line with the covered prompt.  Redisplay then cannot take its
 cheap single-line path: every edit re-lays the line out, and the input
 visibly paints unindented before jumping right.
 
-Drawing the marker as the covered prompt's `display\=' costs nothing per
-edit, and still leaves the input's first line reachable by `previous-line\='
+Drawing the marker as the covered prompt's `display' costs nothing per
+edit, and still leaves the input's first line reachable by `previous-line'
 because it stands on the prompt's own buffer positions rather than adding
-any (contrast a `before-string\=', which would not -- see #786)."
+any (contrast a `before-string', which would not -- see #786)."
   (agent-shell-chat-mode-tests--with-shell
     (agent-shell-chat-mode-tests--prompt "Claude> ")
     (insert "hello\n")
@@ -377,7 +383,7 @@ line, then the marker the input follows."
 (ert-deftest agent-shell-chat-marker-renders-once-test ()
   "The prompt marker is shown once, however many rows the label spans.
 
-With no newline above to carry it, the label renders on the prompt\='s own
+With no newline above to carry it, the label renders on the prompt\\='s own
 overlay and each of its blank lines becomes a row of that line.  A marker
 travelling as a prefix would then repeat down every one of those rows,
 which is what a cleared shell renders."
@@ -395,7 +401,7 @@ which is what a cleared shell renders."
       (should-not (string-match-p "❯" (or (overlay-get me 'wrap-prefix) ""))))))
 
 (ert-deftest agent-shell-chat-label-not-indented-on-own-line-test ()
-  "A label rendering on the prompt\='s line is not indented with the input.
+  "A label rendering on the prompt\\='s line is not indented with the input.
 
 With no newline above to carry it the label renders there, so an indent
 meant for the input would shift the label too, leaving it out of line
@@ -559,10 +565,118 @@ of a line, and that is where the covered prompt sits."
                                (eq (overlay-get overlay 'agent-shell-chat--tag)
                                    'me-input))
                              (overlays-in (point-min) (point-max)))))
-      ;; Only the submitted turn gets an indent overlay; the live prompt does not.
+      ;; Only the submitted turn gets an indent overlay; the live prompt's
+      ;; draft is covered by its own.
       (should (= 1 (length input)))
       (should (equal agent-shell-chat--body-indent
                      (overlay-get (car input) 'line-prefix))))))
+
+(ert-deftest agent-shell-chat-live-draft-indented-test ()
+  "The live prompt's draft carries the body indent below its first line.
+The marker indents the first line; this indents the lines under it, which
+the overlay covering the prompt text cannot reach.  It is in place before
+anything is typed and takes in what follows, since no relabel runs per
+keystroke."
+  (agent-shell-chat-mode-tests--with-shell
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (let ((agent-shell-prompt-bar-mode nil))
+      (agent-shell-chat--relabel))
+    (let ((draft (agent-shell-chat-mode-tests--draft-overlay)))
+      (should draft)
+      (should (equal agent-shell-chat--body-indent
+                     (overlay-get draft 'line-prefix)))
+      (should (equal agent-shell-chat--body-indent
+                     (overlay-get draft 'wrap-prefix)))
+      ;; Empty while nothing is typed, and grows with what is.
+      (should (= (overlay-start draft) (overlay-end draft)))
+      (goto-char (point-max))
+      (insert "first line\nsecond line")
+      (should (= (overlay-end draft) (point-max))))))
+
+(ert-deftest agent-shell-chat-draft-empty-last-line-indented-test ()
+  "A newline in the draft leaves its empty last line indented too.
+That line starts at end of buffer, where there is no character to carry
+the draft's `line-prefix', so the caret would sit flush left until the
+next one arrived.  A string standing there indents it meanwhile, and
+steps aside once a character can carry the prefix.  The draft's own
+modification hooks keep this in step, since no relabel runs while a
+prompt is being typed."
+  (agent-shell-chat-mode-tests--with-shell
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (let ((agent-shell-prompt-bar-mode nil))
+      (agent-shell-chat--relabel))
+    (let ((draft (agent-shell-chat-mode-tests--draft-overlay)))
+      (should draft)
+      (goto-char (point-max))
+      (should (equal "" (overlay-get draft 'after-string)))
+      (insert "one")
+      (should (equal "" (overlay-get draft 'after-string)))
+      (insert "\n")
+      (should (equal agent-shell-chat--body-indent
+                     (overlay-get draft 'after-string)))
+      ;; The first character of the new line takes over.
+      (insert "t")
+      (should (equal "" (overlay-get draft 'after-string)))
+      ;; Deleting back to the empty line brings it back.
+      (delete-char -1)
+      (should (equal agent-shell-chat--body-indent
+                     (overlay-get draft 'after-string)))
+      ;; A relabel mid-draft leaves it alone.
+      (let ((agent-shell-prompt-bar-mode nil))
+        (agent-shell-chat--relabel))
+      (should (equal agent-shell-chat--body-indent
+                     (overlay-get draft 'after-string))))))
+
+(ert-deftest agent-shell-chat-draft-stops-at-submission-test ()
+  "The draft overlay stops growing once the turn is submitted.
+It rear-advances so it covers what is typed without waiting for a
+relabel, but the end-of-prompt marker and the response arrive at end of
+buffer too.  Taking those in would indent the agent's output as though it
+were still the draft, until the next relabel dropped the overlay."
+  (agent-shell-chat-mode-tests--with-shell
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (let ((agent-shell-prompt-bar-mode nil))
+      (agent-shell-chat--relabel))
+    (let ((draft (agent-shell-chat-mode-tests--draft-overlay)))
+      (should draft)
+      (goto-char (point-max))
+      (insert "my question\n")
+      (agent-shell-chat-mode-tests--marker)
+      (insert "\nstreamed reply\n")
+      (should (equal "my question\n"
+                     (buffer-substring-no-properties (overlay-start draft)
+                                                     (overlay-end draft))))
+      ;; No stray indent left standing at the marker either.
+      (should (equal "" (overlay-get draft 'after-string))))))
+
+(ert-deftest agent-shell-chat-quoted-marker-keeps-prompt-live-test ()
+  "Text matching the end-of-prompt marker does not end the live prompt.
+The marker is recognised by the `shell-maker--marker' property shell-maker
+writes, not by its characters, so a prompt mentioning the delimiter (as
+one asking about it would) is still the live prompt and still shows its
+marker."
+  (agent-shell-chat-mode-tests--with-shell
+    (insert "an earlier turn\n\n")
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (insert "why does <shell-maker-end-of-prompt> appear?")
+    (let ((agent-shell-prompt-bar-mode nil))
+      (agent-shell-chat--relabel))
+    (should (string-match-p
+             "❯" (agent-shell-chat-mode-tests--marker-string
+                  (car (last (agent-shell-chat-mode-tests--me-overlays))))))))
+
+(ert-deftest agent-shell-chat-quoted-marker-not-a-response-test ()
+  "A response quoting the end-of-prompt marker is labeled once.
+Agents write the delimiter back when asked about it.  Those characters
+carry no `shell-maker--marker' property, and treating them as a boundary
+renders a second agent label partway through the one response."
+  (agent-shell-chat-mode-tests--with-shell
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (insert "explain the delimiter\n")
+    (agent-shell-chat-mode-tests--marker)
+    (insert "\nshell-maker writes <shell-maker-end-of-prompt> after input.\n\n")
+    (agent-shell-chat--relabel)
+    (should (= 1 (length (agent-shell-chat-mode-tests--agent-overlays))))))
 
 (ert-deftest agent-shell-chat-empty-submission-hidden-test ()
   "An empty submission (a prompt with another below it) is not labeled.

@@ -466,14 +466,6 @@ body un-fontified."
         ;; chunk and would otherwise clear our `face' properties.
         (agent-shell-markdown--mirror-face-to-font-lock-face
          (point-min) (point-max))
-        ;; Tag rendered chars so a yank into another buffer drops the
-        ;; styling, display overrides, internal markers, and keymaps
-        ;; we layered on — paste should give plain chars, not our
-        ;; implementation cruft.
-        (put-text-property (point-min) (point-max)
-                           'yank-handler
-                           (list (lambda (s)
-                                   (insert (substring-no-properties s)))))
         ;; Mark rendered chars `fontified' so jit-lock never re-runs over
         ;; them during a mouse drag.  We style via `face'/`font-lock-face'
         ;; text properties, not font-lock keywords (`font-lock-defaults'
@@ -4289,7 +4281,8 @@ Emacs 31+, falling back to `browse-url-of-file' on earlier versions."
 (defun agent-shell-markdown--binary-file-p (file)
   "Return non-nil when FILE looks binary (a NUL byte in its first 4KB).
 This is the heuristic git uses to tell binary from text."
-  (and (file-readable-p file)
+  (and (file-regular-p file)
+       (file-readable-p file)
        (with-temp-buffer
          (set-buffer-multibyte nil)
          (insert-file-contents-literally file nil 0 4096)
@@ -5034,11 +5027,11 @@ subsequent calls from re-processing them — important for
 streaming, where the convert/replace-markup function may be
 invoked many times as content grows.
 
-One pass reads past the tag.  `agent-shell-markdown--linkify-file-references\='
-links a `path:line\=' citation sitting in an inline `code\=' span, which
+One pass reads past the tag.  `agent-shell-markdown--linkify-file-references'
+links a `path:line' citation sitting in an inline `code' span, which
 agents write nearly all of them in.  It tells those spans apart by the
 inline ranges it is handed, never by the tag, so every other tagged
-range is still left alone (see `agent-shell-markdown--linkify-url\=')."
+range is still left alone (see `agent-shell-markdown--linkify-url')."
   (let ((ranges '())
         (pos (point-min))
         (limit (point-max)))
