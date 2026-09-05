@@ -202,6 +202,107 @@ stopped at the caret would never grow to cover what follows it."
             props)
     overlay))
 
+(defun agent-shell-chat--displayed-substring (start end)
+  "Return what the buffer shows between START and END, chat overlays applied.
+
+Chat mode hides the shell prompt and shell-maker's marker behind overlay
+`display', and draws its \"Me\"/agent labels with `before-string', so the
+buffer text and what the user sees disagree.  A copy should follow the
+screen, and `buffer-substring' alone cannot: overlays are not text.
+
+Only chat mode's own overlays are substituted, found by the
+`agent-shell-chat--tag' they already carry.  That keeps this out of the
+business of resolving overlapping overlays by priority, and means an
+image `display' put here by anything else is never stringified.
+
+`after-string' is left out: chat mode uses it for draft indentation,
+which is layout padding like the `line-prefix' a copy already drops.
+
+Returns `buffer-substring' unchanged when chat mode is off.
+
+For example, over a labelled turn whose buffer text is \"Claude> hi\"
+but which shows
+
+  Me
+
+  hi
+
+returns \"Me\\n\\nhi\"."
+  (if (bound-and-true-p agent-shell-chat-mode)
+      (let ((pieces nil)
+            (pos start))
+        (while (< pos end)
+          (let* ((overlay (seq-find (lambda (candidate)
+                                      (and (overlay-get candidate 'agent-shell-chat--tag)
+                                           (= (overlay-start candidate) pos)))
+                                    (overlays-in pos (min end (1+ pos)))))
+                 (display (and overlay (overlay-get overlay 'display)))
+                 (next (min end (next-overlay-change pos))))
+            (when-let* ((before (and overlay (overlay-get overlay 'before-string))))
+              (push before pieces))
+            (cond ((stringp display)
+                   (push display pieces)
+                   ;; Skip what the display stands in for, inner overlays
+                   ;; included.  `next' guarantees progress on an empty overlay.
+                   (setq pos (max next (min end (overlay-end overlay)))))
+                  (t
+                   (push (buffer-substring pos next) pieces)
+                   (setq pos next)))))
+        (mapconcat #'identity (nreverse pieces)))
+    (buffer-substring start end)))
+
+(defun agent-shell-chat--tagged-overlays-at (position)
+  "Return chat mode's own overlays starting at POSITION.
+Found by the `agent-shell-chat--tag' they carry, so overlays put here by
+anything else are left out."
+  (when (bound-and-true-p agent-shell-chat-mode)
+    (seq-filter (lambda (candidate)
+                  (and (overlay-get candidate 'agent-shell-chat--tag)
+                       (= (overlay-start candidate) position)))
+                (overlays-in position (1+ position)))))
+
+(defun agent-shell-chat--turn-label-at (position)
+  "Return the turn label chat mode draws at POSITION, or nil for none.
+
+Read from the overlay's `agent-shell-chat--tag' rather than its
+`before-string', which wraps the name in layout (blank lines, the prompt
+glyph).  An overlay drawing no label carries an empty `before-string'
+rather than none, so emptiness is what rules it out: counting it would
+label a turn twice.
+
+For example, at a submitted turn returns \"Me\"."
+  (when-let* ((labelled (seq-find
+                         (lambda (candidate)
+                           (and (memq (overlay-get candidate 'agent-shell-chat--tag)
+                                      '(me me-label agent))
+                                (not (string-empty-p
+                                      (or (overlay-get candidate 'before-string) "")))))
+                         (agent-shell-chat--tagged-overlays-at position))))
+    (if (eq (overlay-get labelled 'agent-shell-chat--tag) 'agent)
+        (agent-shell-chat--agent-name)
+      "Me")))
+
+(defun agent-shell-chat--hidden-range-at (position)
+  "Return the range chat mode draws over at POSITION, or nil for none.
+
+The text is hidden by an overlay `display' standing in its place, which
+is why a reader must not take it: it is not on screen.
+
+Keys `:start' and `:end' bound the hidden text, `:end' exclusive as in
+`buffer-substring', so a reader resumes there.
+
+For example, over a buffer reading \"Claude> question\" whose prompt is
+drawn over:
+
+  ((:start . 1) (:end . 9))
+
+putting the resume point at the \"q\" of \"question\"."
+  (when-let* ((hiding (seq-find (lambda (candidate)
+                                  (stringp (overlay-get candidate 'display)))
+                                (agent-shell-chat--tagged-overlays-at position))))
+    (list (cons :start (overlay-start hiding))
+          (cons :end (overlay-end hiding)))))
+
 (defun agent-shell-chat--draft-tail-indent (beg end)
   "Return the indent a draft spanning BEG..END needs on its last line.
 

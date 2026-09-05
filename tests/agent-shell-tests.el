@@ -1647,7 +1647,6 @@ to reach it the same way `:default-model-id' does."
                    (setq sent-request (plist-get args :request))
                    (funcall (plist-get args :on-success) nil))))
         (agent-shell--set-default-config-options
-         :shell-buffer (current-buffer)
          :config-options '(("model" . "gpt-5.5"))
          :on-options-set (lambda () (setq finished t)))))
     (should (equal (map-elt sent-request :method) "session/set_model"))
@@ -1694,7 +1693,6 @@ Cline tags both its `provider' and `model' options with category
                          sent)
                    (funcall (plist-get args :on-success)))))
         (agent-shell--set-default-config-options
-         :shell-buffer (current-buffer)
          :config-options '(("provider" . "cline")
                            ("model" . "gpt-5.5"))
          :on-options-set #'ignore)))
@@ -1728,7 +1726,6 @@ stalling the rest of initialization."
                          sent)
                    (funcall (plist-get args :on-success)))))
         (agent-shell--set-default-config-options
-         :shell-buffer (current-buffer)
          :config-options '(("model" . "anthropic/claude-opus-4-5")
                            ("thought_level" . "high")
                            ("fast" . "on")
@@ -1742,6 +1739,167 @@ stalling the rest of initialization."
                    '(("model" . "anthropic/claude-opus-4-5")
                      ("effort" . "high")
                      ("fast" . "on"))))
+    (should finished)))
+
+(ert-deftest agent-shell--set-default-config-options-tolerates-malformed-entry-test ()
+  "Test an entry that is not an (OPTION . VALUE) pair is skipped, not fatal.
+
+Writing \='(\"effort\") for \='((\"effort\" . \"high\")) is an easy typo.
+Destructuring it blindly throws before the list finishes, and since the
+throw lands before initialization completes, every later prompt retries
+it and never gets sent."
+  (let ((sent nil)
+        (reported "")
+        (warnings nil)
+        (finished nil))
+    (with-temp-buffer
+      (setq-local agent-shell--state
+                  (append (list (cons :buffer (current-buffer))
+                                (cons :session (list (cons :id "session-1"))))
+                          (agent-shell-tests--opencode-config-options-state)))
+      (cl-letf (((symbol-function 'agent-shell--state)
+                 (lambda () agent-shell--state))
+                ((symbol-function 'agent-shell--update-bootstrapping-fragment)
+                 (lambda (&rest args)
+                   (if (string-match-p "unapplied" (format "%s" (plist-get args :block-id)))
+                       (push (plist-get args :body) warnings)
+                     (setq reported (concat reported (or (plist-get args :body) ""))))))
+                ((symbol-function 'agent-shell--emit-event)
+                 (lambda (&rest _)))
+                ((symbol-function 'agent-shell--set-session-config-option)
+                 (lambda (&rest args)
+                   (push (plist-get args :config-id) sent)
+                   (funcall (plist-get args :on-success)))))
+        (agent-shell--set-default-config-options
+         :config-options '("effort" ("fast" . "on"))
+         :on-options-set (lambda () (setq finished t)))))
+    ;; The bare string names an option carrying no value, so it is
+    ;; skipped, and the well-formed entry after it still applies.
+    (should (equal (reverse sent) '("fast")))
+    (should (equal reported
+                   "effort: requesting nil... skipped
+fast: requesting on... done"))
+    (should (string-match-p "Warning: Skipped effort: agent offers low, high, max"
+                            (car warnings)))
+    (should finished)))
+
+(ert-deftest agent-shell--set-default-model-reports-refusal-test ()
+  "Test a refused default model reports and still finishes the step.
+
+Setting a default model is optional.  Stopping on a refusal would wedge
+the shell, since every later prompt re-enters initialization, retries
+the same request, and never gets sent."
+  (let ((reported "")
+        (warnings nil)
+        (changed nil))
+    (with-temp-buffer
+      (setq-local agent-shell--state
+                  (list (cons :buffer (current-buffer))
+                        (cons :session (list (cons :id "session-1")))))
+      (cl-letf (((symbol-function 'agent-shell--state)
+                 (lambda () agent-shell--state))
+                ((symbol-function 'agent-shell--update-bootstrapping-fragment)
+                 (lambda (&rest args)
+                   (if (string-match-p "unapplied" (format "%s" (plist-get args :block-id)))
+                       (push (plist-get args :body) warnings)
+                     (setq reported (concat reported (or (plist-get args :body) ""))))))
+                ((symbol-function 'agent-shell--emit-event)
+                 (lambda (&rest _)))
+                ((symbol-function 'agent-shell--config-option-set-model-id)
+                 (lambda (&rest args)
+                   (funcall (plist-get args :on-failure)
+                            '((code . -32602) (message . "unknown model"))
+                            "raw message"))))
+        (agent-shell--set-default-model
+         :model-id "gpt-5.5"
+         :on-model-changed (lambda () (setq changed t)))))
+    (should (equal reported "Requesting gpt-5.5..."))
+    (should (equal (length warnings) 1))
+    (should (string-match-p "Warning: Could not set model to gpt-5.5: unknown model"
+                            (car warnings)))
+    (should changed)))
+
+(ert-deftest agent-shell--set-default-session-mode-reports-refusal-test ()
+  "Test a refused default session mode reports and still finishes the step.
+
+Setting a default mode is optional, so a refusal must not stop
+initialization short of sending the prompt."
+  (let ((reported "")
+        (warnings nil)
+        (changed nil))
+    (with-temp-buffer
+      (setq-local agent-shell--state
+                  (list (cons :buffer (current-buffer))
+                        (cons :session (list (cons :id "session-1")))))
+      (cl-letf (((symbol-function 'agent-shell--state)
+                 (lambda () agent-shell--state))
+                ((symbol-function 'agent-shell--update-bootstrapping-fragment)
+                 (lambda (&rest args)
+                   (if (string-match-p "unapplied" (format "%s" (plist-get args :block-id)))
+                       (push (plist-get args :body) warnings)
+                     (setq reported (concat reported (or (plist-get args :body) ""))))))
+                ((symbol-function 'agent-shell--emit-event)
+                 (lambda (&rest _)))
+                ((symbol-function 'agent-shell--config-option-set-mode-id)
+                 (lambda (&rest args)
+                   (funcall (plist-get args :on-failure)
+                            '((code . -32603))
+                            "raw message"))))
+        (agent-shell--set-default-session-mode
+         :mode-id "plan"
+         :on-mode-changed (lambda () (setq changed t)))))
+    ;; An agent that gives no reason still gets one reported for it.
+    (should (equal reported "Requesting plan..."))
+    (should (string-match-p "Warning: Could not set session mode to plan: agent gave no reason"
+                            (car warnings)))
+    (should changed)))
+
+(ert-deftest agent-shell--set-default-config-options-reports-rejection-test ()
+  "Test a refused config option is reported and does not stall the list.
+
+An agent may reject a value it advertised, and validating against the
+advertised values cannot catch that.  Reporting the refusal and moving
+on keeps the shell reaching its prompt, where aborting would leave
+initialization hanging with no prompt at all."
+  (let ((sent nil)
+        (reported "")
+        (warnings nil)
+        (finished nil))
+    (with-temp-buffer
+      (setq-local agent-shell--state
+                  (append (list (cons :buffer (current-buffer))
+                                (cons :session (list (cons :id "session-1"))))
+                          (agent-shell-tests--opencode-config-options-state)))
+      (cl-letf (((symbol-function 'agent-shell--state)
+                 (lambda () agent-shell--state))
+                ((symbol-function 'agent-shell--update-bootstrapping-fragment)
+                 (lambda (&rest args)
+                   (if (string-match-p "unapplied" (format "%s" (plist-get args :block-id)))
+                       (push (plist-get args :body) warnings)
+                     (setq reported (concat reported (or (plist-get args :body) ""))))))
+                ((symbol-function 'agent-shell--emit-event)
+                 (lambda (&rest _)))
+                ((symbol-function 'agent-shell--set-session-config-option)
+                 (lambda (&rest args)
+                   (push (plist-get args :config-id) sent)
+                   (if (equal (plist-get args :config-id) "effort")
+                       (funcall (plist-get args :on-failure)
+                                '((code . -32602)
+                                  (message . "unsupported effort"))
+                                "raw message")
+                     (funcall (plist-get args :on-success))))))
+        (agent-shell--set-default-config-options
+         :config-options '(("effort" . "high")
+                           ("fast" . "on"))
+         :on-options-set (lambda () (setq finished t)))))
+    ;; The refused entry reports the agent's reason, and "fast" still runs.
+    (should (equal (reverse sent) '("effort" "fast")))
+    (should (equal reported
+                   "effort: requesting high... failed
+fast: requesting on... done"))
+    (should (equal (length warnings) 1))
+    (should (string-match-p "Warning: Could not set effort to high: unsupported effort"
+                            (car warnings)))
     (should finished)))
 
 (ert-deftest agent-shell--session-from-response-config-options-test ()
@@ -4454,6 +4612,79 @@ markers."
         (should-not (text-properties-at pos copied))
         (setq pos (1+ pos))))))
 
+(ert-deftest agent-shell-buffer-markdown-substring-nests-agent-headings ()
+  "A tool call becomes a heading and the agent's headings sit under it.
+An agent heading left at its own level would outrank the structure
+around it, inverting the pasted document."
+  (with-temp-buffer
+    (insert "## Section\n\nfile contents\n")
+    (agent-shell-markdown-replace-markup :complete t)
+    (goto-char (point-min))
+    (insert "Read README.org\n\n")
+    (put-text-property (point-min) (+ (point-min) 15)
+                       'agent-shell-ui-section 'label-left)
+    (should (equal (agent-shell--buffer-markdown-substring (point-min) (point-max))
+                   "### Read README.org\n\n##### Section\n\nfile contents"))))
+
+(ert-deftest agent-shell-buffer-markdown-substring-keeps-deep-headings-put ()
+  "Agent headings already near the floor are left where they are.
+Pushing them past `######' would stop them being headings at all, and
+flattening them together would silently merge levels."
+  (with-temp-buffer
+    (insert "###### Deep\n\nbody\n")
+    (agent-shell-markdown-replace-markup :complete t)
+    (should (equal (agent-shell--buffer-markdown-substring (point-min) (point-max))
+                   "###### Deep\n\nbody"))))
+
+(ert-deftest agent-shell-buffer-markdown-substring-marks-unselected-body ()
+  "A fragment heading whose body is outside the region keeps its shape."
+  (with-temp-buffer
+    (insert "Read README.org\n\nfile contents\n")
+    (put-text-property (point-min) (+ (point-min) 15)
+                       'agent-shell-ui-section 'label-left)
+    (should (equal (agent-shell--buffer-markdown-substring (point-min) (+ (point-min) 15))
+                   "### Read README.org\n\n..."))))
+
+(ert-deftest agent-shell-filter-buffer-substring-copies-what-chat-mode-shows ()
+  "Copying a labelled turn yields the label, not the prompt it covers.
+Chat mode renders \"Me\" over the shell prompt, so a copy that returned
+the buffer text would carry terminal chrome the user never saw."
+  (with-temp-buffer
+    (setq-local agent-shell-chat-mode t)
+    (let ((inhibit-read-only t))
+      (insert "Pi> hello\n")
+      (insert (propertize "<shell-maker-end-of-prompt>"
+                          'shell-maker--marker t 'invisible t))
+      (insert "\nworld\n"))
+    (let ((overlay (make-overlay 1 5)))
+      (overlay-put overlay 'agent-shell-chat--tag 'me)
+      (overlay-put overlay 'display "")
+      (overlay-put overlay 'before-string "Me\n\n"))
+    (should (equal (agent-shell--filter-buffer-substring (point-min) (point-max))
+                   "Me\n\nhello\n\nworld\n"))))
+
+(ert-deftest agent-shell-filter-buffer-substring-strips-shell-maker-markers ()
+  "Copying drops shell-maker's markers, invisible on screen.
+A copy spanning a prompt would otherwise carry text the user never saw."
+  (with-temp-buffer
+    (let ((inhibit-read-only t))
+      (insert "Claude> what is 2+2\n")
+      (insert (propertize "<shell-maker-end-of-prompt>"
+                          'shell-maker--marker t
+                          'invisible t 'field 'output 'read-only t))
+      (insert "\n4\n"))
+    (should (equal (agent-shell--filter-buffer-substring (point-min) (point-max))
+                   "Claude> what is 2+2\n\n4\n"))))
+
+(ert-deftest agent-shell-filter-buffer-substring-keeps-marker-shaped-response ()
+  "Copying keys on the marker property, not its text.
+An agent asked about `<shell-maker-end-of-prompt>' writes those very
+characters into its response, and they must survive the copy."
+  (with-temp-buffer
+    (insert "shell-maker writes <shell-maker-end-of-prompt> after input.")
+    (should (equal (agent-shell--filter-buffer-substring (point-min) (point-max))
+                   "shell-maker writes <shell-maker-end-of-prompt> after input."))))
+
 (ert-deftest agent-shell-filter-buffer-substring-strips-block-quote-prefix ()
   "Copying quoted text drops the \"> \" `agent-shell--block-quote' added."
   (with-temp-buffer
@@ -6267,7 +6498,7 @@ why it did neither."
       (user-error (error-message-string error)))))
 
 (ert-deftest agent-shell-prompt-steer-test ()
-  "Test `agent-shell-prompt-steer' refuses when there is no turn to steer."
+  "Test `agent-shell-prompt-steer' guards choose to steer, submit or refuse."
   (should (eq (agent-shell-tests--steer-guard :busy t :supported t :status 'busy)
               'steered))
   ;; An idle agent has no turn to join, so the prompt starts its own.
@@ -6287,14 +6518,15 @@ why it did neither."
   (should (eq (agent-shell-tests--steer-guard :busy t :supported t :status 'blocked
                                               :confirm t)
               'steered))
-  ;; Steering bypasses shell-maker, so a blank prompt would reach the wire.
+  ;; A blank prompt is refused on either path.  Steering bypasses
+  ;; shell-maker entirely, and letting one through when idle would silently
+  ;; reprint the shell prompt rather than say why nothing happened.
   (should (equal (agent-shell-tests--steer-guard :busy t :supported t :status 'busy
                                                  :prompt "  \n ")
-                 "No prompt to steer"))
-  ;; Idle does reach shell-maker, which reprints its prompt for a blank one.
-  (should (eq (agent-shell-tests--steer-guard :busy nil :supported t :status 'ready
-                                              :prompt "  \n ")
-              'submitted)))
+                 "No prompt given"))
+  (should (equal (agent-shell-tests--steer-guard :busy nil :supported t :status 'ready
+                                                 :prompt "  \n ")
+                 "No prompt given")))
 
 (ert-deftest agent-shell-prompt-steer-guards-before-reading-test ()
   "Test `agent-shell-prompt-steer' refuses before asking for a prompt.

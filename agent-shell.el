@@ -4,10 +4,10 @@
 
 ;; Author: Alvaro Ramirez https://xenodium.com
 ;; URL: https://github.com/xenodium/agent-shell
-;; Version: 0.75.1
+;; Version: 0.75.2
 ;; Package-Requires: ((emacs "29.1") (shell-maker "0.97.2") (acp "0.14.3"))
 
-(defconst agent-shell--version "0.75.1")
+(defconst agent-shell--version "0.75.2")
 
 ;; This package is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -1978,6 +1978,92 @@ instead."
     (user-error "No agent running"))
   (message "Copied last output"))
 
+(defun agent-shell--buffer-markdown-substring (beg end)
+  "Return the text between BEG and END as markdown, structure included.
+
+The shell shows structure the reconstructed markdown has no way to
+express: whose turn a passage belongs to, and which tool call a body
+sits under.  Both are drawn as chrome (a covered prompt, a fold
+triangle), so a plain reconstruction pastes them as terminal glyphs or
+loses them.  This renders them as headings instead: a turn opens `#', a
+group of tool calls `##', and a tool call `###'.  A group owns the
+fragments below it rather than a body of its own, so its children sit
+one level under it.
+
+The agent's own headings are pushed down to sit under those, by as many
+levels as still fit inside the six markdown allows.  A response already
+reaching `######' is left where it is rather than flattened, so nothing
+is ever silently merged into a level it did not have.
+
+A fragment whose body falls outside the region still gets its heading,
+with `...' standing in for the body, so a partial copy keeps the shape
+of what it came from.
+
+For example, a copied tool call renders as:
+
+  # Claude
+
+  ### Read README.org
+
+  file contents"
+  (let ((deepen (if-let* ((deepest (agent-shell-markdown-deepest-header beg end)))
+                    (min 3 (max 0 (- 6 deepest)))
+                  3))
+        (parts nil)
+        (headed nil)
+        (pos beg))
+    (while (< pos end)
+      (let ((section (get-text-property pos 'agent-shell-ui-section))
+            (turn (agent-shell-chat--turn-label-at pos))
+            (hidden (agent-shell-chat--hidden-range-at pos))
+            ;; Break wherever any of the three kinds of structure starts or
+            ;; stops.  They do not line up with each other, so sampling only
+            ;; one kind's boundaries steps straight over the others.
+            (next (min end
+                       (or (next-single-property-change
+                            pos 'agent-shell-ui-section nil end)
+                           end)
+                       (or (next-single-property-change
+                            pos 'shell-maker--marker nil end)
+                           end)
+                       (next-overlay-change pos))))
+        (when turn
+          (push (format "\n\n# %s\n\n" turn) parts))
+        (cond
+         ;; The fold triangle says "collapsed" about a body the copy
+         ;; carries anyway, and means nothing in a document.
+         ((eq section 'indicator))
+         ((get-text-property pos 'shell-maker--marker))
+         ((eq section 'label-left)
+          (when headed
+            (push "...\n\n" parts))
+          (let ((group (eq (map-elt (get-text-property pos 'agent-shell-ui-state) :kind)
+                           'group)))
+            (push (format "%s %s\n\n"
+                          (if group "##" "###")
+                          (string-trim (agent-shell-markdown-reconstruct pos next)))
+                  parts)
+            ;; A group heads the fragments below it, so it is not itself left
+            ;; wanting a body.
+            (setq headed (not group))))
+         ;; Chat mode covers the shell prompt with an overlay `display', so
+         ;; the buffer text under it is chrome the heading above replaces.
+         (hidden
+          (setq next (min end (map-elt hidden :end))))
+         (t
+          (let ((text (agent-shell-markdown-reconstruct pos next deepen)))
+            (unless (string-blank-p text)
+              (setq headed nil))
+            (push text parts))))
+        (setq pos next)))
+    (when headed
+      (push "..." parts))
+    ;; Headings bring their own blank line and so does the buffer text they
+    ;; sit above, which would otherwise stack up as gaps in the paste.
+    (string-trim (replace-regexp-in-string
+                  (rx "\n" (>= 2 "\n")) "\n\n"
+                  (apply #'concat (nreverse parts))))))
+
 (defun agent-shell-copy-as-markdown (beg end)
   "Copy the region between BEG and END to the kill ring as markdown.
 
@@ -1990,9 +2076,13 @@ fenced code blocks with their ```language fences, and tables.  A
 construct only partially selected (for example a single line of a
 code block) is copied verbatim as shown.
 
+Structure the shell draws as chrome becomes headings: a turn opens
+`#' and a tool call `##', with the agent's own headings pushed
+underneath.  See `agent-shell--buffer-markdown-substring'.
+
 Interactively, operates on the active region."
   (interactive "r")
-  (kill-new (agent-shell-markdown-reconstruct beg end))
+  (kill-new (agent-shell--buffer-markdown-substring beg end))
   (setq deactivate-mark t)
   (message "Copied as markdown"))
 
@@ -2108,6 +2198,10 @@ See also `agent-shell-confirm-interrupt'."
   "Return the text between START and END, adjusted for copying.
 If DELETE is non-nil, delete the text between START and END.
 
+What the buffer shows is what gets copied: chat mode's labels come along
+and the prompt and marker they cover do not, since it draws them with
+overlays rather than text (see `agent-shell-chat--displayed-substring').
+
 A paste elsewhere should give plain characters rather than agent-shell's
 implementation, so every text property is dropped: our faces, keymaps,
 cursor sensors, display overrides and internal markers all go.  One
@@ -2122,6 +2216,11 @@ system clipboard and isearch kept the raw \"> \".
 place, so the buffer already holds rendered text and there is nothing
 here to strip beyond those properties.
 
+shell-maker's structural markers go as well.  They are invisible on
+screen, so a copy spanning a prompt would otherwise carry
+\"<shell-maker-end-of-prompt>\" and friends into the kill ring, text the
+user never saw.
+
 A collapsed fold indicator is also pointed down, since the body it hides
 is copied along with it.
 
@@ -2130,12 +2229,20 @@ For example, copying a collapsed thought:
   \"▶ Thought\\nSo the user wants...\"
   => \"▼ Thought\\nSo the user wants...\"
 
+or copying across a prompt boundary:
+
+  \"ask<shell-maker-end-of-prompt>\\nanswer\"
+  => \"ask\\nanswer\"
+
 START and END may be given in either order, like the stock
 `buffer-substring': a reversed range (START > END, e.g. a right-to-left
 mouse selection or a kill where mark > point) is normalized."
   (let* ((beg (min start end))
          (fin (max start end))
-         (text (buffer-substring beg fin)))
+         ;; Chat mode hides the prompt and shell-maker's marker behind
+         ;; overlay `display' and draws its labels with `before-string', so
+         ;; buffer text and screen disagree.  Follow the screen.
+         (text (agent-shell-chat--displayed-substring beg fin)))
     (when delete
       (delete-region beg fin))
     ;; Point collapsed indicators down before the properties go, since this
@@ -2156,6 +2263,16 @@ mouse selection or a kill where mark > point) is normalized."
                             'indicator)
                     (replace-match "▼" t t)))
                 (buffer-string)))))
+    ;; Drop shell-maker's markers, keyed on the property it tags them with
+    ;; rather than on their text, so a response that merely mentions
+    ;; "<shell-maker-end-of-prompt>" keeps its own words.  This is the same
+    ;; discriminator `shell-maker--find-marker' uses.
+    (when (string-search "<shell-maker-" text)
+      (setq text (replace-regexp-in-string
+                  (rx "<shell-maker-" (+ (any "a-z-")) ">")
+                  (lambda (match)
+                    (if (get-text-property 0 'shell-maker--marker match) "" match))
+                  text nil t)))
     ;; One "> " per line, matching what the block quote inserted, so
     ;; quoting already-quoted text keeps the inner level.
     (substring-no-properties
@@ -2288,7 +2405,6 @@ Flow:
                                          '(:agent-config :default-model-id)))
                 (not (map-elt (agent-shell--state) :set-model)))
            (agent-shell--set-default-model
-            :shell-buffer shell-buffer
             :model-id (funcall (map-nested-elt (agent-shell--state)
                                                '(:agent-config :default-model-id)))
             :on-model-changed (lambda ()
@@ -2299,7 +2415,6 @@ Flow:
                 (funcall (map-nested-elt (agent-shell--state) '(:agent-config :default-session-mode-id)))
                 (not (map-elt (agent-shell--state) :set-session-mode)))
            (agent-shell--set-default-session-mode
-            :shell-buffer shell-buffer
             :mode-id (funcall (map-nested-elt (agent-shell--state) '(:agent-config :default-session-mode-id)))
             :on-mode-changed (lambda ()
                                (map-put! (agent-shell--state) :set-session-mode t)
@@ -2309,7 +2424,6 @@ Flow:
                 (funcall (map-nested-elt (agent-shell--state) '(:agent-config :default-config-options)))
                 (not (map-elt (agent-shell--state) :set-config-options)))
            (agent-shell--set-default-config-options
-            :shell-buffer shell-buffer
             :config-options (funcall (map-nested-elt (agent-shell--state) '(:agent-config :default-config-options)))
             :on-options-set (lambda ()
                               (map-put! (agent-shell--state) :set-config-options t)
@@ -6651,53 +6765,85 @@ Call ON-SUCCESS on success, or ON-FAILURE on error."
     ;; thought level, so it is not a config option, it cannot be changed
     (user-error "Agent does not advertise a thought level option for this session")))
 
-(cl-defun agent-shell--set-default-model (&key shell-buffer model-id on-model-changed)
-  "Set default model to MODEL-ID in SHELL-BUFFER.
-Call ON-MODEL-CHANGED on success."
-  (when (map-nested-elt (agent-shell--state) '(:session :id))
-    (with-current-buffer (map-elt agent-shell--state :buffer)
-      (agent-shell--update-bootstrapping-fragment
-       :state (agent-shell--state)
-       :block-id "set-model"
-       :label-left (propertize "Setting model" 'font-lock-face 'agent-shell-section-heading)
-       :body (format "Requesting %s..." model-id)))
-    (agent-shell--config-option-set-model-id
-     :model-id model-id
-     :on-success (lambda ()
-                   (agent-shell--update-bootstrapping-fragment
-                    :state (agent-shell--state)
-                    :block-id "set-model"
-                    :body "\n\nDone"
-                    :append t)
-                   (agent-shell--emit-event :event 'init-model)
-                   (when on-model-changed
-                     (funcall on-model-changed)))
-     :on-failure (agent-shell--make-error-handler
-                  :state (agent-shell--state) :shell-buffer shell-buffer))))
+(cl-defun agent-shell--set-default-model (&key model-id on-model-changed)
+  "Set default model to MODEL-ID.
 
-(cl-defun agent-shell--set-default-session-mode (&key shell-buffer mode-id on-mode-changed)
-  "Set default session mode to MODE-ID in SHELL-BUFFER.
-Call ON-MODE-CHANGED on success."
-  (when (map-nested-elt (agent-shell--state) '(:session :id))
-    (with-current-buffer (map-elt agent-shell--state :buffer)
-      (agent-shell--update-bootstrapping-fragment
-       :state (agent-shell--state)
-       :block-id "set-session-mode"
-       :label-left (propertize "Setting session mode" 'font-lock-face 'agent-shell-section-heading)
-       :body (format "Requesting %s..." mode-id)))
-    (agent-shell--config-option-set-mode-id
-     :mode-id mode-id
-     :on-success (lambda ()
-                   (agent-shell--update-bootstrapping-fragment
-                    :state (agent-shell--state)
-                    :block-id "set-session-mode"
-                    :body "\n\nDone"
-                    :append t)
-                   (agent-shell--emit-event :event 'init-session-mode)
-                   (when on-mode-changed
-                     (funcall on-mode-changed)))
-     :on-failure (agent-shell--make-error-handler
-                  :state (agent-shell--state) :shell-buffer shell-buffer))))
+Call ON-MODEL-CHANGED once the request settles, whether the agent
+applied the model or refused it.  Setting a default model is optional,
+so a refusal is reported and initialization continues.  Stopping here
+would wedge the shell: every later prompt re-enters initialization,
+retries the same request, and never gets sent."
+  (unless (map-nested-elt (agent-shell--state) '(:session :id))
+    (error "No session to set default model"))
+  (with-current-buffer (map-elt agent-shell--state :buffer)
+    (agent-shell--update-bootstrapping-fragment
+     :state (agent-shell--state)
+     :block-id "set-model"
+     :label-left (propertize "Setting model" 'font-lock-face 'agent-shell-section-heading)
+     :body (format "Requesting %s..." model-id)))
+  (agent-shell--config-option-set-model-id
+   :model-id model-id
+   :on-success (lambda ()
+                 (agent-shell--update-bootstrapping-fragment
+                  :state (agent-shell--state)
+                  :block-id "set-model"
+                  :body "\n\nDone"
+                  :append t)
+                 (agent-shell--emit-event :event 'init-model)
+                 (when on-model-changed
+                   (funcall on-model-changed)))
+   :on-failure (lambda (acp-error _raw-message)
+                 ;; Its own block: the step's block carries a label, so it
+                 ;; folds shut and this would go unread inside it.
+                 (agent-shell--update-bootstrapping-fragment
+                  :state (agent-shell--state)
+                  :block-id "set-model-unapplied"
+                  :body (agent-shell--make-boxed-message
+                         :text (format "Warning: Could not set model to %s: %s"
+                                       model-id
+                                       (or (map-elt acp-error 'message)
+                                           "agent gave no reason"))))
+                 (when on-model-changed
+                   (funcall on-model-changed)))))
+
+(cl-defun agent-shell--set-default-session-mode (&key mode-id on-mode-changed)
+  "Set default session mode to MODE-ID.
+
+Call ON-MODE-CHANGED once the request settles, whether the agent
+applied the mode or refused it.  Setting a default mode is optional, so
+a refusal is reported and initialization continues.  Stopping here
+would wedge the shell: every later prompt re-enters initialization,
+retries the same request, and never gets sent."
+  (unless (map-nested-elt (agent-shell--state) '(:session :id))
+    (error "No session to set default session mode"))
+  (with-current-buffer (map-elt agent-shell--state :buffer)
+    (agent-shell--update-bootstrapping-fragment
+     :state (agent-shell--state)
+     :block-id "set-session-mode"
+     :label-left (propertize "Setting session mode" 'font-lock-face 'agent-shell-section-heading)
+     :body (format "Requesting %s..." mode-id)))
+  (agent-shell--config-option-set-mode-id
+   :mode-id mode-id
+   :on-success (lambda ()
+                 (agent-shell--update-bootstrapping-fragment
+                  :state (agent-shell--state)
+                  :block-id "set-session-mode"
+                  :body "\n\nDone"
+                  :append t)
+                 (agent-shell--emit-event :event 'init-session-mode)
+                 (when on-mode-changed
+                   (funcall on-mode-changed)))
+   :on-failure (lambda (acp-error _raw-message)
+                 (agent-shell--update-bootstrapping-fragment
+                  :state (agent-shell--state)
+                  :block-id "set-session-mode-unapplied"
+                  :body (agent-shell--make-boxed-message
+                         :text (format "Warning: Could not set session mode to %s: %s"
+                                       mode-id
+                                       (or (map-elt acp-error 'message)
+                                           "agent gave no reason"))))
+                 (when on-mode-changed
+                   (funcall on-mode-changed)))))
 
 (defun agent-shell--default-config-option-values (state option)
   "Return the value ids STATE advertises for OPTION.
@@ -6760,13 +6906,16 @@ For example:
       (format "agent offers %s" (string-join values ", "))
     (format "agent advertises no %s option" option)))
 
-(cl-defun agent-shell--set-default-config-options (&key shell-buffer config-options (first t) on-options-set)
-  "Apply CONFIG-OPTIONS in SHELL-BUFFER, one at a time, in order.
+(cl-defun agent-shell--set-default-config-options (&key config-options (first t) on-options-set)
+  "Apply CONFIG-OPTIONS one at a time, in order.
 
 CONFIG-OPTIONS is an alist of (OPTION . VALUE), as described in
 `agent-shell-make-agent-config'.  Applying them in sequence (rather
 than concurrently) lets an earlier entry determine what a later one can
 choose from, since agents re-advertise their options on every change.
+
+An entry that is not an (OPTION . VALUE) pair is reported and skipped
+like any other entry the agent cannot satisfy.
 
 FIRST tracks whether the next entry opens the progress report, and is
 managed by the recursion.
@@ -6774,13 +6923,16 @@ managed by the recursion.
 Call ON-OPTIONS-SET once the list is exhausted."
   (if-let* ((entry (car config-options)))
       (agent-shell--set-default-config-option
-       :shell-buffer shell-buffer
-       :option (car entry)
-       :value (cdr entry)
+       ;; An entry that is not a pair is a typo in the user's alist
+       ;; ("effort" for ("effort" . "high")).  Read it as an option
+       ;; naming no value, so it is reported like any other entry the
+       ;; agent cannot satisfy.  Destructuring it blindly would throw
+       ;; here, and initialization would never reach the prompt.
+       :option (if (consp entry) (car entry) entry)
+       :value (when (consp entry) (cdr entry))
        :first first
        :on-option-set (lambda ()
                         (agent-shell--set-default-config-options
-                         :shell-buffer shell-buffer
                          :config-options (cdr config-options)
                          :first nil
                          :on-options-set on-options-set)))
@@ -6788,48 +6940,78 @@ Call ON-OPTIONS-SET once the list is exhausted."
     (when on-options-set
       (funcall on-options-set))))
 
-(cl-defun agent-shell--set-default-config-option (&key shell-buffer option value first on-option-set)
-  "Set config OPTION to VALUE in SHELL-BUFFER, then call ON-OPTION-SET.
+(cl-defun agent-shell--set-default-config-option (&key option value first on-option-set)
+  "Set config OPTION to VALUE, then call ON-OPTION-SET.
 
 Agents advertise options conditionally (thought levels only for models
 supporting them, for example) and scope values to the active model, so
-an unknown option or value is reported and skipped rather than
-aborting initialization.
+an option or value the agent does not offer is reported and skipped
+rather than aborting initialization.  A request the agent refuses is
+reported the same way, since an agent may reject a value it
+advertised.
+
+Every outcome calls ON-OPTION-SET.  Stopping on one entry would wedge
+the shell: every later prompt re-enters initialization, retries the
+same entry, and never gets sent.
 
 FIRST reports this as the opening line of the shared progress block,
 which later entries append their own line to."
-  (when (map-nested-elt (agent-shell--state) '(:session :id))
-    (with-current-buffer (map-elt agent-shell--state :buffer)
-      (agent-shell--update-bootstrapping-fragment
-       :state (agent-shell--state)
-       :block-id "set-config-options"
-       :label-left (propertize "Setting config options" 'font-lock-face 'agent-shell-section-heading)
-       :body (format "%s%s: requesting %s..." (if first "" "\n") option value)
-       :append t))
-    (if (agent-shell--default-config-option-settable-p (agent-shell--state) option value)
-        (agent-shell--send-default-config-option
-         :shell-buffer shell-buffer
-         :option option
-         :value value
-         :on-sent (lambda ()
-                    (agent-shell--update-bootstrapping-fragment
-                     :state (agent-shell--state)
-                     :block-id "set-config-options"
-                     :body " done"
-                     :append t)
-                    (when on-option-set
-                      (funcall on-option-set))))
-      (agent-shell--update-bootstrapping-fragment
-       :state (agent-shell--state)
-       :block-id "set-config-options"
-       :body (format " skipped (%s)"
-                     (agent-shell--default-config-option-skip-reason (agent-shell--state) option))
-       :append t)
-      (when on-option-set
-        (funcall on-option-set)))))
+  (unless (map-nested-elt (agent-shell--state) '(:session :id))
+    (error "No session to set default config option"))
+  (with-current-buffer (map-elt agent-shell--state :buffer)
+    (agent-shell--update-bootstrapping-fragment
+     :state (agent-shell--state)
+     :block-id "set-config-options"
+     :label-left (propertize "Setting config options" 'font-lock-face 'agent-shell-section-heading)
+     :body (format "%s%s: requesting %s..." (if first "" "\n") option value)
+     :append t))
+  (if (agent-shell--default-config-option-settable-p (agent-shell--state) option value)
+      (agent-shell--request-default-config-option
+       :option option
+       :value value
+       :on-success (lambda ()
+                     (agent-shell--update-bootstrapping-fragment
+                      :state (agent-shell--state)
+                      :block-id "set-config-options"
+                      :body " done"
+                      :append t)
+                     (when on-option-set
+                       (funcall on-option-set)))
+       :on-failure (lambda (acp-error _raw-message)
+                     (agent-shell--update-bootstrapping-fragment
+                      :state (agent-shell--state)
+                      :block-id "set-config-options"
+                      :body " failed"
+                      :append t)
+                     (agent-shell--update-bootstrapping-fragment
+                      :state (agent-shell--state)
+                      :block-id (format "set-config-option-unapplied-%s" option)
+                      :body (agent-shell--make-boxed-message
+                             :text (format "Warning: Could not set %s to %s: %s"
+                                           option value
+                                           (or (map-elt acp-error 'message)
+                                               "agent gave no reason"))))
+                     (when on-option-set
+                       (funcall on-option-set))))
+    (agent-shell--update-bootstrapping-fragment
+     :state (agent-shell--state)
+     :block-id "set-config-options"
+     :body " skipped"
+     :append t)
+    (agent-shell--update-bootstrapping-fragment
+     :state (agent-shell--state)
+     :block-id (format "set-config-option-unapplied-%s" option)
+     :body (agent-shell--make-boxed-message
+            :text (format "Warning: Skipped %s: %s"
+                          option
+                          (agent-shell--default-config-option-skip-reason (agent-shell--state) option))))
+    (when on-option-set
+      (funcall on-option-set))))
 
-(cl-defun agent-shell--send-default-config-option (&key shell-buffer option value on-sent)
-  "Ask the agent to set OPTION to VALUE, then call ON-SENT.
+(cl-defun agent-shell--request-default-config-option (&key option value on-success on-failure)
+  "Ask the agent to set OPTION to VALUE.
+
+Call ON-SUCCESS on success, or ON-FAILURE on error.
 
 The ACP categories \"model\" and \"mode\" route through the setters
 owning their legacy fallbacks, so an agent advertising no config
@@ -6837,23 +7019,22 @@ options is still reachable over `session/set_model' and
 `session/set_mode'.  Any other OPTION resolves to an advertised
 config option and goes out as `session/set_config_option'.
 
-SHELL-BUFFER is where a rejected request reports its error."
-  (let ((on-failure (agent-shell--make-error-handler
-                     :state (agent-shell--state) :shell-buffer shell-buffer)))
-    (pcase option
-      ("model" (agent-shell--config-option-set-model-id
-                :model-id value
-                :on-success on-sent
-                :on-failure on-failure))
-      ("mode" (agent-shell--config-option-set-mode-id
-               :mode-id value
-               :on-success on-sent
-               :on-failure on-failure))
-      (_ (agent-shell--set-session-config-option
-          :config-id (map-elt (agent-shell--resolve-config-option (agent-shell--state) option) :id)
-          :value value
-          :on-success on-sent
-          :on-failure on-failure)))))
+ON-FAILURE takes (acp-error raw-message), as the setters this routes
+to do."
+  (pcase option
+    ("model" (agent-shell--config-option-set-model-id
+              :model-id value
+              :on-success on-success
+              :on-failure on-failure))
+    ("mode" (agent-shell--config-option-set-mode-id
+             :mode-id value
+             :on-success on-success
+             :on-failure on-failure))
+    (_ (agent-shell--set-session-config-option
+        :config-id (map-elt (agent-shell--resolve-config-option (agent-shell--state) option) :id)
+        :value value
+        :on-success on-success
+        :on-failure on-failure))))
 
 (cl-defun agent-shell--initiate-session (&key shell-buffer on-session-init)
   "Initiate ACP session creation with SHELL-BUFFER.
