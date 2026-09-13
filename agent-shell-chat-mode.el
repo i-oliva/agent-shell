@@ -347,6 +347,16 @@ putting the resume point at the \"q\" of \"question\"."
     (list (cons :start (overlay-start hiding))
           (cons :end (overlay-end hiding)))))
 
+(defun agent-shell-chat--draft-indent ()
+  "Return the indent lining a draft's later lines up with its first.
+The first line shares the prompt's row, starting past the marker drawn
+there, so the lines below it clear the marker's width as well as the
+body indent to start at the same column.  A submitted turn drops back to
+`agent-shell-chat--body-indent', where the marker is gone and the
+response body sits."
+  (concat agent-shell-chat--body-indent
+          (make-string (string-width agent-shell-chat--prompt) ?\s)))
+
 (defun agent-shell-chat--draft-tail-indent (beg end)
   "Return the indent a draft spanning BEG..END needs on its last line.
 
@@ -357,10 +367,10 @@ to carry the prefix.  A string standing at that position indents the row
 instead, and gives way (to \"\") the moment there is a character for the
 prefix itself.
 
-For example, over a draft of \"one\\n\" returns the body indent, and over
+For example, over a draft of \"one\\n\" returns the draft indent, and over
 \"one\" returns \"\"."
   (if (and (> end beg) (eq (char-before end) ?\n))
-      agent-shell-chat--body-indent
+      (agent-shell-chat--draft-indent)
     ""))
 
 (defun agent-shell-chat--draft-changed (draft after &rest _)
@@ -629,10 +639,12 @@ above, putting the first line of a multi-line input out of reach of
                                              agent-shell-chat--prompt)
                                      'face 'default)))
                ;; Indents the prompt's own line, which the input's first line
-               ;; shares.  An unlabeled run has no input to line up.
-               (input-indent (if (and labeled (not blank))
-                                 agent-shell-chat--body-indent
-                               ""))
+               ;; shares.  Where a marker heads that line, the first line starts
+               ;; past it, so its wrapped rows clear the marker too.  An
+               ;; unlabeled run has no input to line up.
+               (input-indent (cond ((or (not labeled) blank) "")
+                                   (marker (agent-shell-chat--draft-indent))
+                                   (t agent-shell-chat--body-indent)))
                ;; The label, closed by the newline it rides rather than by the
                ;; second half of `pad'.
                (before (cond ((not labeled) "")
@@ -753,8 +765,8 @@ above, putting the first line of a multi-line input out of reach of
              (agent-shell-chat--ensure-overlay
               :tag 'me-draft :beg run-end :end (point-max)
               :rear-advance t
-              :props (list (cons 'line-prefix agent-shell-chat--body-indent)
-                           (cons 'wrap-prefix agent-shell-chat--body-indent)
+              :props (list (cons 'line-prefix (agent-shell-chat--draft-indent))
+                           (cons 'wrap-prefix (agent-shell-chat--draft-indent))
                            ;; Indents a last line left empty by a newline,
                            ;; which the prefix cannot reach.  The hooks keep
                            ;; it in step with what is typed.

@@ -6,6 +6,10 @@
 
 ;;; Code:
 
+(defconst agent-shell-tests--directory
+  (file-name-directory (or load-file-name buffer-file-name))
+  "Directory holding this test file.")
+
 (ert-deftest agent-shell-make-environment-variables-test ()
   "Test `agent-shell-make-environment-variables' function."
   ;; Test basic key-value pairs
@@ -6998,6 +7002,23 @@ Then [after](https://after.com/y)
     (should (eq (char-after) ?B))
     (agent-shell-previous-item)
     (should (eq (char-after) ?A))))
+
+(ert-deftest agent-shell-dependency-floors-match-package-requires-test ()
+  "Runtime dependency floors match the versions `Package-Requires\' declares.
+
+`agent-shell--start\' refuses to run against a dependency older than its
+floor.  Nothing derives those floors from the header, so this pairs them:
+bumping one and not the other leaves the check accepting a version the
+package declares unsupported."
+  (require 'lisp-mnt)
+  (let ((declared (with-temp-buffer
+                    (insert-file-contents (expand-file-name "../agent-shell.el"
+                                                            agent-shell-tests--directory))
+                    (read (string-join (lm-header-multiline "package-requires") " ")))))
+    (should (equal (cadr (assq 'shell-maker declared))
+                   agent-shell--shell-maker-minimum-version))
+    (should (equal (cadr (assq 'acp declared))
+                   agent-shell--acp-minimum-version))))
 
 (provide 'agent-shell-tests)
 ;;; agent-shell-tests.el ends here

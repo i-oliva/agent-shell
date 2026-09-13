@@ -714,6 +714,53 @@ Needs a real window to measure, so it is skipped in batch."
       (should (= (agent-shell-chat-mode-tests--column-of "second line")
                  (agent-shell-chat-mode-tests--column-of "reply"))))))
 
+(ert-deftest agent-shell-chat-draft-indent-clears-marker-test ()
+  "A draft's later lines are indented past the marker its first line follows.
+
+The first line shares the prompt's row and starts after the marker drawn
+there, so an indent of the body's width alone would leave every line
+below it two columns to the left of the line it continues (see #806)."
+  (should (= (string-width (agent-shell-chat--draft-indent))
+             (+ (string-width agent-shell-chat--body-indent)
+                (string-width agent-shell-chat--prompt))))
+  (agent-shell-chat-mode-tests--with-shell
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (insert "hello\n")
+    (agent-shell-chat-mode-tests--marker)
+    (insert "reply\n\n")
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (insert "first line\nsecond line")
+    (let ((agent-shell-prompt-bar-mode nil))
+      (agent-shell-chat--relabel))
+    (let ((draft (agent-shell-chat-mode-tests--draft-overlay)))
+      (should draft)
+      (should (equal (agent-shell-chat--draft-indent)
+                     (overlay-get draft 'line-prefix)))
+      (should (equal (agent-shell-chat--draft-indent)
+                     (overlay-get draft 'wrap-prefix))))))
+
+(ert-deftest agent-shell-chat-draft-lines-share-a-column-test ()
+  "Every line of a draft renders at the column its first line starts at.
+
+Needs a real window to measure, so it is skipped in batch."
+  (skip-unless (not noninteractive))
+  (agent-shell-chat-mode-tests--with-shell
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (insert "typed\n")
+    (agent-shell-chat-mode-tests--marker)
+    (insert "\n")
+    (insert (propertize "reply\n" 'line-prefix "  " 'wrap-prefix "  "))
+    (insert "\n")
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (insert "first line\nsecond line")
+    (let ((agent-shell-prompt-bar-mode nil))
+      (agent-shell-chat--relabel))
+    (let ((window (selected-window)))
+      (set-window-buffer window (current-buffer))
+      (set-window-start window (point-min))
+      (should (= (agent-shell-chat-mode-tests--column-of "first line")
+                 (agent-shell-chat-mode-tests--column-of "second line"))))))
+
 (ert-deftest agent-shell-chat-turn-label-at-reads-drawn-rows-test ()
   "Each turn reports its label once, however the label is drawn.
 
@@ -864,9 +911,9 @@ prompt, so the input's row starts where that overlay does."
                      (overlay-get (car input) 'line-prefix))))))
 
 (ert-deftest agent-shell-chat-live-draft-indented-test ()
-  "The live prompt's draft carries the body indent below its first line.
-The marker indents the first line; this indents the lines under it, which
-the overlay covering the prompt text cannot reach.  It is in place before
+  "The live prompt's draft carries the draft indent below its first line.
+The marker indents the first line; this indents the lines under it to the
+same column, which the overlay covering the prompt text cannot reach.  It is in place before
 anything is typed and takes in what follows, since no relabel runs per
 keystroke."
   (agent-shell-chat-mode-tests--with-shell
@@ -875,9 +922,9 @@ keystroke."
       (agent-shell-chat--relabel))
     (let ((draft (agent-shell-chat-mode-tests--draft-overlay)))
       (should draft)
-      (should (equal agent-shell-chat--body-indent
+      (should (equal (agent-shell-chat--draft-indent)
                      (overlay-get draft 'line-prefix)))
-      (should (equal agent-shell-chat--body-indent
+      (should (equal (agent-shell-chat--draft-indent)
                      (overlay-get draft 'wrap-prefix)))
       ;; Empty while nothing is typed, and grows with what is.
       (should (= (overlay-start draft) (overlay-end draft)))
@@ -904,19 +951,19 @@ prompt is being typed."
       (insert "one")
       (should (equal "" (overlay-get draft 'after-string)))
       (insert "\n")
-      (should (equal agent-shell-chat--body-indent
+      (should (equal (agent-shell-chat--draft-indent)
                      (overlay-get draft 'after-string)))
       ;; The first character of the new line takes over.
       (insert "t")
       (should (equal "" (overlay-get draft 'after-string)))
       ;; Deleting back to the empty line brings it back.
       (delete-char -1)
-      (should (equal agent-shell-chat--body-indent
+      (should (equal (agent-shell-chat--draft-indent)
                      (overlay-get draft 'after-string)))
       ;; A relabel mid-draft leaves it alone.
       (let ((agent-shell-prompt-bar-mode nil))
         (agent-shell-chat--relabel))
-      (should (equal agent-shell-chat--body-indent
+      (should (equal (agent-shell-chat--draft-indent)
                      (overlay-get draft 'after-string))))))
 
 (ert-deftest agent-shell-chat-draft-stops-at-submission-test ()
@@ -965,7 +1012,7 @@ of buffer.  Reading the draft's bounds under that restriction signals
       ;; Still covering everything typed, and still indenting the empty
       ;; last line the newline left.
       (should (= (overlay-end draft) (point-max)))
-      (should (equal agent-shell-chat--body-indent
+      (should (equal (agent-shell-chat--draft-indent)
                      (overlay-get draft 'after-string))))))
 
 (ert-deftest agent-shell-chat-quoted-marker-keeps-prompt-live-test ()
