@@ -3,6 +3,122 @@
 (require 'ert)
 (require 'agent-shell-codex)
 
+(defun agent-shell-codex-test--with-index (test)
+  "Call TEST with a temporary Codex home and writable session database."
+  (unless (and (fboundp 'sqlite-available-p) (sqlite-available-p))
+    (ert-skip "SQLite support unavailable"))
+  (let* ((directory (make-temp-file "codex-index-" t))
+         (agent-shell-codex-session-directory directory)
+         (db (sqlite-open (expand-file-name "state_5.sqlite" directory) nil)))
+    (unwind-protect
+        (progn
+          (with-temp-file (expand-file-name "config.toml" directory)
+            (insert "model_provider = 'local'\n[profiles.other]\nmodel_provider = 'other'\n"))
+          (with-temp-file (expand-file-name "rollout.jsonl" directory))
+          (sqlite-execute
+           db (format "CREATE TABLE threads (id TEXT, cwd TEXT, title TEXT,
+updated_at INTEGER, archived INTEGER, source TEXT, model_provider TEXT,
+rollout_path TEXT DEFAULT '%s')" (expand-file-name "rollout.jsonl" directory)))
+          (funcall test directory db))
+      (sqlite-close db)
+      (delete-directory directory t))))
+
+(ert-deftest agent-shell-codex-local-index-filters-and-sorts-test ()
+  "Keep this project's current-provider root threads, including old ones."
+  (agent-shell-codex-test--with-index
+   (lambda (directory db)
+     (dolist (row '(("old" 1 0 "cli" "local")
+                    ("new" 9 0 "vscode" "local")
+                    ("archived" 10 1 "cli" "local")
+                    ("child" 11 0 "subagent" "local")
+                    ("provider" 12 0 "cli" "other")))
+       (sqlite-execute db "INSERT INTO threads (id,cwd,title,updated_at,archived,source,model_provider) VALUES (?, ?, ?, ?, ?, ?, ?)"
+                       (append (list (car row) directory (car row)) (cdr row))))
+     (sqlite-execute db "INSERT INTO threads (id,cwd,title,updated_at,archived,source,model_provider) VALUES ('elsewhere', '/', 'Other', 20, 0, 'cli', 'local')")
+     (sqlite-execute db "INSERT INTO threads VALUES ('deleted', ?, 'Deleted', 30, 0, 'cli', 'local', '/missing/rollout.jsonl')"
+                     (list directory))
+     (let ((sessions (cdr (agent-shell-codex--local-sessions directory))))
+       (should (equal (mapcar (lambda (s) (map-elt s 'sessionId)) sessions)
+                      '("new" "old")))
+       (should (equal (map-elt (car sessions) 'updatedAt) "1970-01-01T00:00:09Z"))))))
+
+(ert-deftest agent-shell-codex-local-index-resolves-project-symlinks-test ()
+  "Both project aliases and canonical paths find the same saved thread."
+  (agent-shell-codex-test--with-index
+   (lambda (directory db)
+     (let ((alias (expand-file-name "alias" directory))
+           (project (expand-file-name "project" directory)))
+       (make-directory project)
+       (make-symbolic-link project alias)
+       (sqlite-execute db "INSERT INTO threads (id,cwd,title,updated_at,archived,source,model_provider) VALUES ('saved', ?, 'Saved', 1, 0, 'cli', 'local')"
+                       (list alias))
+       (should (= 1 (length (cdr (agent-shell-codex--local-sessions project)))))
+       (should (= 1 (length (cdr (agent-shell-codex--local-sessions alias)))))))))
+
+(ert-deftest agent-shell-codex-local-index-empty-skips-acp-test ()
+  "A valid empty index returns promptly without a remote history scan."
+  (agent-shell-codex-test--with-index
+   (lambda (directory _db)
+     (let ((result :not-called))
+       (agent-shell-codex--list-sessions-a
+        (lambda (&rest _) (ert-fail "Unexpected ACP scan"))
+        :state '((:agent-config . ((:identifier . codex))))
+        :cwd directory :on-success (lambda (sessions) (setq result sessions)))
+       (should-not result)))))
+
+(ert-deftest agent-shell-codex-local-index-uses-newest-schema-and-name-test ()
+  "The highest schema number wins, and renamed threads keep their titles."
+  (agent-shell-codex-test--with-index
+   (lambda (directory db)
+     (sqlite-execute db "ALTER TABLE threads ADD COLUMN name TEXT")
+     (sqlite-execute db "ALTER TABLE threads ADD COLUMN preview TEXT")
+     (sqlite-execute db "INSERT INTO threads (id,cwd,title,updated_at,archived,source,model_provider,name,preview) VALUES ('named', ?, 'Old title', 1, 0, 'cli', 'local', 'Renamed', 'Preview')"
+                     (list directory))
+     (copy-file (expand-file-name "state_5.sqlite" directory)
+                (expand-file-name "state_10.sqlite" directory))
+     (sqlite-execute db "DELETE FROM threads")
+     (should (equal (map-elt (cadr (agent-shell-codex--local-sessions directory)) 'title)
+                    "Renamed")))))
+
+(ert-deftest agent-shell-codex-local-index-missing-falls-back-test ()
+  "A missing or incompatible database preserves normal ACP discovery."
+  (agent-shell-codex-test--with-index
+   (lambda (directory db)
+     (sqlite-execute db "DROP TABLE threads")
+     (let ((called nil))
+       (agent-shell-codex--list-sessions-a
+        (lambda (&rest _) (setq called t))
+        :state '((:agent-config . ((:identifier . codex)))) :cwd directory)
+       (should called))
+     (let ((agent-shell-codex-session-directory
+            (expand-file-name "missing" directory)))
+       (should-not (agent-shell-codex--local-sessions directory))))))
+
+(ert-deftest agent-shell-codex-local-index-other-agents-use-acp-test ()
+  "The opt-in local index does not intercept other agents or TRAMP."
+  (let ((agent-shell-codex-session-directory "/tmp")
+        (called nil))
+    (cl-letf (((symbol-function 'agent-shell-codex--local-sessions)
+               (lambda (_) (ert-fail "Other agent consulted Codex index"))))
+      (agent-shell-codex--list-sessions-a
+       (lambda (&rest _) (setq called t))
+       :state '((:agent-config . ((:identifier . openclaw)))) :cwd "/tmp"))
+    (should called)
+    (should-not (agent-shell-codex--local-sessions "/ssh:host:/project/"))))
+
+(ert-deftest agent-shell-codex-local-index-is-read-only-test ()
+  "Session discovery opens the user's database in read-only mode."
+  (agent-shell-codex-test--with-index
+   (lambda (directory _db)
+     (let ((open (symbol-function 'sqlite-open))
+           (readonly nil))
+       (cl-letf (((symbol-function 'sqlite-open)
+                  (lambda (path &optional mode &rest _)
+                    (setq readonly mode)
+                    (funcall open path mode))))
+         (should (agent-shell-codex--local-sessions directory)))
+       (should readonly)))))
+
 (ert-deftest agent-shell-codex-profile-environment-pins-provider-test ()
   "The Codex ACP environment pins the provider for start and resume."
   (should

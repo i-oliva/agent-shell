@@ -8,6 +8,9 @@
 (ert-deftest agent-shell-session-push-status-lifecycle-test ()
   "A push is tracked as active and answered on session_push_end (v0.74.3)."
   (with-temp-buffer
+    (insert "Codex> ")
+    (setq-local comint-last-prompt
+                (cons (copy-marker (point-min)) (copy-marker (point-max))))
     (let* ((responses nil)
            (heartbeat-started nil)
            (heartbeat-stopped nil)
