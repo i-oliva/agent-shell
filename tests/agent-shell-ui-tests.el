@@ -5,6 +5,81 @@
 
 ;;; Code:
 
+(defun agent-shell-ui-tests--replay-index-result (indexed)
+  "Render mixed history with INDEXED lookup and return text and fold states."
+  (with-temp-buffer
+    (agent-shell-ui-mode 1)
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "ns" :block-id "existing" :label-left "Existing" :body "old"))
+    (agent-shell-ui-update-text :namespace-id "ns" :block-id "text" :text "begin")
+    (let ((agent-shell-ui--block-index (and indexed (agent-shell-ui--make-block-index))))
+      (agent-shell-ui-update-text :namespace-id "ns" :block-id "text" :text " end" :append t)
+      (agent-shell-ui-update-text :namespace-id "ns" :block-id "new-text" :text "new")
+      (agent-shell-ui-update-text :namespace-id "ns" :block-id "new-text" :text " revised")
+      (dotimes (i 30)
+        (agent-shell-ui-update-fragment
+         (agent-shell-ui-make-fragment-model
+          :namespace-id "ns" :block-id (format "tool-%s" i)
+          :group-id (format "group-%s" (% i 3)) :group-label "Activity"
+          :group-expanded nil :label-left "Tool" :body "first")
+         :navigation 'always))
+      (dotimes (i 30)
+        (agent-shell-ui-update-fragment
+         (agent-shell-ui-make-fragment-model
+          :namespace-id "ns" :block-id (format "tool-%s" i) :body " second")
+         :append t))
+      (agent-shell-ui-update-fragment
+       (agent-shell-ui-make-fragment-model
+        :namespace-id "ns" :block-id "existing" :body "replaced"))
+      (agent-shell-ui-delete-fragment :namespace-id "ns" :block-id "existing")
+      (agent-shell-ui-delete-fragment :namespace-id "ns" :block-id "missing"))
+    (list (buffer-substring-no-properties (point-min) (point-max))
+          (mapcar (lambda (i) (agent-shell-ui-tests--fragment-collapsed-p "ns" (format "tool-%s" i)))
+                  (number-sequence 0 29)))))
+
+(ert-deftest agent-shell-ui-replay-index-preserves-history-test ()
+  "Indexed replay preserves full text, replacements, groups and folded bodies."
+  (should (equal (agent-shell-ui-tests--replay-index-result nil)
+                 (agent-shell-ui-tests--replay-index-result t))))
+
+(ert-deftest agent-shell-ui-replay-index-avoids-absent-dialog-scans-test ()
+  "Completed historical tools do not scan the buffer for absent permissions."
+  (with-temp-buffer
+    (agent-shell-ui-mode 1)
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "ns" :block-id "tool" :body "Historical tool output"))
+    (let ((agent-shell-ui--block-index (agent-shell-ui--make-block-index)))
+      (cl-letf (((symbol-function 'text-property-search-backward)
+                 (lambda (&rest _) (ert-fail "Scanned for an absent historical permission"))))
+        (dotimes (i 100)
+          (agent-shell-ui-delete-fragment :namespace-id "ns" :block-id (format "permission-%s" i)))))))
+
+(ert-deftest agent-shell-ui-replay-index-does-not-leak-across-buffers-test ()
+  "An index for one shell never hides existing blocks in another buffer."
+  (with-temp-buffer
+    (let ((agent-shell-ui--block-index (agent-shell-ui--make-block-index)))
+      (with-temp-buffer
+        (agent-shell-ui-mode 1)
+        (agent-shell-ui-update-text :namespace-id "ns" :block-id "text" :text "before")
+        (agent-shell-ui-update-text :namespace-id "ns" :block-id "text" :text "after")
+        (should (equal (string-trim (buffer-substring-no-properties (point-min) (point-max)))
+                       "after"))))))
+
+(ert-deftest agent-shell-ui-replay-index-is-discarded-before-external-edits-test ()
+  "New content after replay is found normally, including after a buffer erase."
+  (with-temp-buffer
+    (agent-shell-ui-mode 1)
+    (let ((agent-shell-ui--block-index (agent-shell-ui--make-block-index)))
+      (agent-shell-ui-update-text :namespace-id "ns" :block-id "old" :text "old"))
+    (should-not agent-shell-ui--block-index)
+    (let ((inhibit-read-only t)) (erase-buffer))
+    (agent-shell-ui-update-text :namespace-id "ns" :block-id "new" :text "new")
+    (agent-shell-ui-update-text :namespace-id "ns" :block-id "new" :text " appended" :append t)
+    (should (equal (string-trim (buffer-substring-no-properties (point-min) (point-max)))
+                   "new appended"))))
+
 (ert-deftest agent-shell-ui-body-invisible-p-handles-whitespace-only-body ()
   ;; Regression for PR #597 (pi-acp): the markdown renderer strips
   ;; an empty `\\`\\`\\`console' fence down to a body of only
