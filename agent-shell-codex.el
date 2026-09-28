@@ -12,6 +12,7 @@
   (require 'cl-lib))
 (require 'agent-shell)
 (require 'agent-shell-openai)
+(require 'agent-shell-codex-history)
 (require 'sqlite nil t)
 
 (declare-function agent-shell--display-buffer "agent-shell")
