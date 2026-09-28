@@ -138,18 +138,31 @@
   "Face for level-6 headers rendered by `agent-shell-markdown-convert'."
   :group 'agent-shell-markdown)
 
+(defface agent-shell-markdown-table
+  '((t nil))
+  "Base face for every character of a rendered table.
+Carries no attributes of its own, so default rendering is unchanged.
+Plain data rows carry it directly, while
+`agent-shell-markdown-table-header',
+`agent-shell-markdown-table-border' and
+`agent-shell-markdown-table-zebra' inherit it, listing it last so
+their own attributes still win.  One face therefore covers a whole
+table, which is what face-remapping setups such as
+`mixed-pitch-mode' need to pin every column to the same font."
+  :group 'agent-shell-markdown)
+
 (defface agent-shell-markdown-table-header
-  '((t :inherit bold))
+  '((t :inherit (bold agent-shell-markdown-table)))
   "Face for table header row content."
   :group 'agent-shell-markdown)
 
 (defface agent-shell-markdown-table-border
-  '((t :inherit font-lock-comment-face))
+  '((t :inherit (font-lock-comment-face agent-shell-markdown-table)))
   "Face for table borders (pipes and dashes)."
   :group 'agent-shell-markdown)
 
 (defface agent-shell-markdown-table-zebra
-  '((t :inherit lazy-highlight))
+  '((t :inherit (lazy-highlight agent-shell-markdown-table)))
   "Face for alternating (zebra) data rows in tables."
   :group 'agent-shell-markdown)
 
@@ -940,7 +953,8 @@ mouse, a hand pointer, and the target itself on
 `agent-shell-markdown-url' -- which is what
 `agent-shell-markdown-link-url-at-point' reads and what item
 navigation stops on, so a link missing it would open on RET yet stay
-invisible to both.
+invisible to both.  Web URLs also carry `browse-url-data', so
+terminal Emacs can display them as OSC 8 hyperlinks when enabled.
 
 VERB names the action in both hints (see
 `agent-shell-markdown--link-verb' for the default and when it
@@ -970,7 +984,22 @@ browser\", and hovering shows \"Open in browser\"."
                                    (substring text 1)))))
     ;; A hand pointer when over is enough. No need for `mouse-face'.
     (put-text-property start end 'pointer 'hand)
-    (put-text-property start end 'agent-shell-markdown-url url)))
+    (put-text-property start end 'agent-shell-markdown-url url)
+    ;; `browse-url-data' is where Emacs keeps a URL on text (see
+    ;; `browse-url-button-open' and `ansi-osc-hyperlink-handler').
+    ;; Nothing here reads it, as agent-shell keymap handles RET and clicks,
+    ;; but a terminal Emacs that emits OSC 8 hyperlinks from it lets
+    ;; the terminal open web links on its own machine, which matters
+    ;; when Emacs runs remotely (for example over SSH), where
+    ;; `browse-url' would open them on the remote host.  Only web
+    ;; URLs are tagged, with a bare `www.' host given a scheme so it
+    ;; opens as such.
+    (let ((case-fold-search t))
+      (put-text-property
+       start end 'browse-url-data
+       (cond ((string-match-p "\\`https?://[^/?#[:space:]]+" url) url)
+             ((string-match-p "\\`www\\.[^/?#[:space:]]+" url)
+              (concat "https://" url)))))))
 
 (defun agent-shell-markdown--add-link-face (start end)
   "Add the link face over [START, END), skipping where it already is.
@@ -3940,7 +3969,8 @@ prone to a few-pixel drift on emoji-heavy tables."
                               (= (mod data-row-num 2) 1)))
                (row-face (cond
                           (is-header 'agent-shell-markdown-table-header)
-                          (is-zebra 'agent-shell-markdown-table-zebra))))
+                          (is-zebra 'agent-shell-markdown-table-zebra)
+                          ((not is-separator) 'agent-shell-markdown-table))))
           (unless (or is-header is-separator)
             (setq data-row-num (1+ data-row-num)))
           (push (if is-separator
@@ -4462,21 +4492,67 @@ meaningless for binary)."
 Matches a line (\"10\"), a range (\"10-24\", GitHub's \"10-L24\") and a
 line with a column (\"10:5\").")
 
-(defconst agent-shell-markdown--file-reference-regexp
-  (rx (any alnum "._~/@_")
-      (zero-or-more (any alnum "._~/@+_-"))
-      (or "#L" ":")
+(defconst agent-shell-markdown--file-reference-location-regexp
+  (rx (or "#L" ":")
       (regexp agent-shell-markdown--location-regexp))
-  "Regexp matching a bare `path:line' reference as agents cite sources.
+  "Regexp matching the location of a bare `path:line' reference.
+That is the separator and what follows it: `:500', `:120-140', `:12:5'
+and `#L12'.  The path before it is read by
+`agent-shell-markdown--search-file-reference'.")
 
-Matches the whole reference, path included, in the forms
+(defconst agent-shell-markdown--file-reference-path-chars "[:alnum:]._~/@+_-"
+  "Chars a bare `path:line' reference's path is made of.
+In `skip-chars-backward' form.  A path does not start with `+' or `-'
+though; see `agent-shell-markdown--search-file-reference'.")
+
+(defun agent-shell-markdown--search-file-reference ()
+  "Search forward from point for a bare `path:line' reference.
+
+Return (START . END) of the reference, leaving point at END, or nil
+when there is none, leaving point where it started, as
+`re-search-forward' with NOERROR t does.  Run this with
+`case-fold-search' nil, as
+`agent-shell-markdown--linkify-file-references' does, so that `#L'
+does not also match `#l'.  A reference is how agents cite sources,
+in the forms
 `agent-shell-markdown--parse-local-link' reads: `docs/audit.md:500',
 `src/main.rs:120-140', `foo.el:12:5' and `foo.el#L12'.  A line is
 required, so a bare path in prose is not a reference.
 
+This is a `re-search-forward' in two steps: the location
+\(`agent-shell-markdown--file-reference-location-regexp') is found
+first, then the path is read back off the chars before it.  A single
+regexp for the whole reference would restart its greedy path match at
+every char of a long unbroken run of path chars (an opaque token in a
+message, say), which is quadratic in the run's length: minutes of
+frozen Emacs on a 100 KB one.  This way each char is visited a bounded
+number of times.  The path is never read back past where the search
+started, as a regexp match could not begin before it either.
+
 Whether the path names an existing file is not asked here -- see
 `agent-shell-markdown--linkify-file-references', which is what filters
-the candidates this finds.")
+the candidates this finds."
+  (let ((origin (point))
+        found)
+    (while (and (not found)
+                (re-search-forward
+                 agent-shell-markdown--file-reference-location-regexp nil t))
+      (let ((location (match-beginning 0))
+            (end (match-end 0)))
+        (goto-char location)
+        (skip-chars-backward
+         agent-shell-markdown--file-reference-path-chars origin)
+        (skip-chars-forward "+-" location)
+        (if (>= (point) location)
+            ;; No path before this separator, so it is not a reference, but
+            ;; what looked like its location may hold one: `:1:1' has `1:1'
+            ;; in it, the same as a regexp match starting at the `1' would.
+            (goto-char (1+ location))
+          (setq found (cons (point) end))
+          (goto-char end))))
+    (unless found
+      (goto-char origin))
+    found))
 
 (defun agent-shell-markdown--parse-location (location)
   "Parse LOCATION, the location part of a local link, into an alist.
@@ -4577,10 +4653,10 @@ any rendered link carries (see
 `agent-shell-markdown--apply-link-properties'), so RET opens the file
 at the cited line and item navigation stops there.
 
-What counts as a reference is `agent-shell-markdown--file-reference-regexp',
-read through `agent-shell-markdown--parse-local-link' as any other
-local link is.  There is no markup to strip, so the reference text
-stays as it stands.
+What counts as a reference is what
+`agent-shell-markdown--search-file-reference' finds, read through
+`agent-shell-markdown--parse-local-link' as any other local link is.
+There is no markup to strip, so the reference text stays as it stands.
 
 Two things keep prose from turning into links: a reference has to name
 a line, so a bare path is left alone, and its path -- resolved against
@@ -4609,26 +4685,24 @@ For example, the buffer \"see docs/audit.md:500 now\" keeps its text,
 with \"docs/audit.md:500\" faced and opening that file at line 500."
   (let ((case-fold-search nil))
     (goto-char (point-min))
-    (while (re-search-forward agent-shell-markdown--file-reference-regexp nil t)
-      ;; Read before parsing below, which runs a `string-match' of its own
-      ;; and leaves no match data of this one behind to take positions from.
-      (let ((start (match-beginning 0))
-            (end (match-end 0)))
-        (if-let* ((avoid (agent-shell-markdown-in-avoid-range-p
-                          start end avoid-ranges)))
-            (goto-char (cdr avoid))
-          ;; Point sits right after the match, so this reads the char the
-          ;; number runs into: `foo.el#L2xy' is a word, not a reference.
-          (when (and (not (looking-at-p (rx (any alnum "_"))))
-                     (agent-shell-markdown--parse-local-link
-                      (buffer-substring-no-properties start end)))
-            ;; Inline code is the one place a frozen tag is expected here,
-            ;; and it is read off the ranges rather than the tag, so no
-            ;; other frozen text can slip through as code.
-            (agent-shell-markdown--linkify-url
-             start end
-             :in-code (agent-shell-markdown-in-avoid-range-p
-                       start end inline-ranges))))))))
+    (while-let ((reference (agent-shell-markdown--search-file-reference))
+                (start (car reference))
+                (end (cdr reference)))
+      (if-let* ((avoid (agent-shell-markdown-in-avoid-range-p
+                        start end avoid-ranges)))
+          (goto-char (cdr avoid))
+        ;; Point sits right after the match, so this reads the char the
+        ;; number runs into: `foo.el#L2xy' is a word, not a reference.
+        (when (and (not (looking-at-p (rx (any alnum "_"))))
+                   (agent-shell-markdown--parse-local-link
+                    (buffer-substring-no-properties start end)))
+          ;; Inline code is the one place a frozen tag is expected here,
+          ;; and it is read off the ranges rather than the tag, so no
+          ;; other frozen text can slip through as code.
+          (agent-shell-markdown--linkify-url
+           start end
+           :in-code (agent-shell-markdown-in-avoid-range-p
+                     start end inline-ranges)))))))
 
 (cl-defun agent-shell-markdown--url-copy-file (&key url file (timeout 5.0) content-type-prefix)
   "Download URL to FILE, returning FILE on success or nil on failure.

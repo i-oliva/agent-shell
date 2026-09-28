@@ -29,6 +29,32 @@
       (should (equal (map-elt bounds :start) 3))
       (should (equal (map-elt bounds :end) 7)))))
 
+(ert-deftest agent-shell--capf-exit-with-file-mention-test ()
+  "Completing a path holding whitespace leaves a mention the parser reads whole.
+The buffer already holds @ and the inserted candidate by the time the
+exit function runs, so these start from that state."
+  (with-temp-buffer
+    (insert "@My Design.png")
+    (goto-char (point-max))
+    (agent-shell--capf-exit-with-file-mention "My Design.png" 'finished)
+    (should (equal (buffer-string) "@\"My Design.png\" "))
+    (should (equal (map-elt (seq-first (agent-shell--parse-file-mentions (buffer-string))) :path)
+                   "My Design.png")))
+
+  ;; No whitespace, no quotes.
+  (with-temp-buffer
+    (insert "@src/main.el")
+    (goto-char (point-max))
+    (agent-shell--capf-exit-with-file-mention "src/main.el" 'finished)
+    (should (equal (buffer-string) "@src/main.el ")))
+
+  ;; Text already in the prompt is left alone.
+  (with-temp-buffer
+    (insert "look at @My Design.png")
+    (goto-char (point-max))
+    (agent-shell--capf-exit-with-file-mention "My Design.png" 'finished)
+    (should (equal (buffer-string) "look at @\"My Design.png\" "))))
+
 (defun agent-shell-completion-tests--make-shell ()
   "Return a buffer offering /help and /compact as available commands."
   (let ((shell (generate-new-buffer " *agent-shell-completion-test*")))

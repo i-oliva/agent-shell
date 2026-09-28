@@ -31,6 +31,7 @@
 (require 'seq)
 (require 'agent-shell-project)
 
+(declare-function agent-shell--file-mention "agent-shell")
 (declare-function agent-shell--live-input-prompt-p "agent-shell")
 (declare-function agent-shell--shell-buffer "agent-shell")
 (declare-function agent-shell--project-files "agent-shell-project")
@@ -93,6 +94,25 @@ nil."
   "Insert space after completion."
   (insert " "))
 
+(defun agent-shell--capf-exit-with-file-mention (string status)
+  "Rewrite the completed file STRING as an @ mention, then insert a space.
+
+Completion inserts the candidate bare, so a path holding whitespace would
+be read as a mention ending at its first space.  Rewriting through
+`agent-shell--file-mention' quotes those paths.
+
+STATUS is handed to `agent-shell--capf-exit-with-space'.
+
+For example, completing at the end of a buffer holding
+
+  \"@src/main.el\"    => \"@src/main.el \"
+  \"@My Design.png\"  => \"@\\\"My Design.png\\\" \""
+  (when-let* ((start (- (point) (length string) 1))
+              ((eq (char-after start) ?@)))
+    (delete-region start (point))
+    (insert (agent-shell--file-mention string)))
+  (agent-shell--capf-exit-with-space string status))
+
 (defvar-local agent-shell--project-files-cache nil
   "Session-scoped cache for project files completion.")
 
@@ -133,7 +153,7 @@ buffer.  Returns nil if the override is set but its buffer is dead."
           (buffer-local-value 'agent-shell--project-files-cache source)
           :exclusive 'no
           :company-kind (lambda (f) (if (string-suffix-p "/" f) 'folder 'file))
-          :exit-function #'agent-shell--capf-exit-with-space)))
+          :exit-function #'agent-shell--capf-exit-with-file-mention)))
 
 (defun agent-shell--command-completion-at-point ()
   "Complete available commands after /."

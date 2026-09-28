@@ -9,6 +9,9 @@
 ;; not be loaded); chat-mode reads it with `bound-and-true-p'.
 (defvar agent-shell-prompt-bar-mode)
 
+;; Likewise for `agent-shell' itself, which is not loaded here.
+(defvar agent-shell-show-busy-indicator)
+
 ;; A self-contained `:extend' background face, standing in for a code
 ;; block panel (whose real face lives in `agent-shell-markdown', not
 ;; loaded here).  `:extend' is what chat-mode keys off, not the color.
@@ -858,6 +861,166 @@ so it does not vanish mid-type when a relabel runs."
                                 (eq (overlay-get overlay 'agent-shell-chat--tag)
                                     'me-input))
                               (overlays-in (point-min) (point-max)))))))
+
+(defun agent-shell-chat-mode-tests--beat (status value)
+  "Set the shell's heartbeat to STATUS at VALUE, as a heartbeat tick does."
+  (setf (map-elt agent-shell--state :heartbeat)
+        (list (cons :status status) (cons :value value))))
+
+(defun agent-shell-chat-mode-tests--busy-marker (beat)
+  "Return the live marker as drawn on BEAT while busy.
+Read from `agent-shell-chat-busy-frames', so the frames can change
+without these tests.
+
+For example, on beat 1 returns \"/ ❯ \"."
+  (concat (seq-elt agent-shell-chat-busy-frames beat) " " agent-shell-chat--prompt))
+
+(ert-deftest agent-shell-chat-live-marker-animates-while-busy-test ()
+  "A busy agent animates the live prompt's marker, a frame per beat.
+Drawn as the covered prompt's `display', where the label rides the newline
+above, and back to the plain marker once the heartbeat ends."
+  (agent-shell-chat-mode-tests--with-shell
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (insert "hello\n")
+    (agent-shell-chat-mode-tests--marker)
+    (insert "reply\n\n")
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (let ((agent-shell-prompt-bar-mode nil)
+          (agent-shell-show-busy-indicator t))
+      (agent-shell-chat-mode-tests--beat 'busy 0)
+      (agent-shell-chat--relabel)
+      (let ((me (car (last (agent-shell-chat-mode-tests--me-overlays)))))
+        (should (equal (overlay-get me 'display)
+                       (agent-shell-chat-mode-tests--busy-marker 0)))
+        (agent-shell-chat-mode-tests--beat 'busy 1)
+        (agent-shell-chat--animate-live-marker)
+        (should (equal (overlay-get me 'display)
+                       (agent-shell-chat-mode-tests--busy-marker 1)))
+        (agent-shell-chat-mode-tests--beat 'ended nil)
+        (agent-shell-chat--animate-live-marker)
+        (should (equal (overlay-get me 'display) "  ❯ "))))))
+
+(ert-deftest agent-shell-chat-live-marker-animates-beside-label-test ()
+  "The marker animates where it is drawn after the `Me' label, too.
+With no newline above to ride, the label and marker share the prompt's
+`before-string', and a tick rewrites the marker alone."
+  (agent-shell-chat-mode-tests--with-shell
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (let ((agent-shell-prompt-bar-mode nil)
+          (agent-shell-show-busy-indicator t))
+      (agent-shell-chat-mode-tests--beat 'busy 0)
+      (agent-shell-chat--relabel)
+      (let ((me (car (agent-shell-chat-mode-tests--me-overlays))))
+        (should (string-suffix-p (concat "\n" (agent-shell-chat-mode-tests--busy-marker 0))
+                                 (overlay-get me 'before-string)))
+        (agent-shell-chat-mode-tests--beat 'busy 1)
+        (agent-shell-chat--animate-live-marker)
+        (should (string-suffix-p (concat " Me \n\n" (agent-shell-chat-mode-tests--busy-marker 1))
+                                 (overlay-get me 'before-string)))))))
+
+(ert-deftest agent-shell-chat-live-marker-aligns-past-frame-test ()
+  "The space after a busy frame aligns the marker to the body indent.
+A frame's glyph can come from a fallback font wider than a column, which
+would otherwise push the marker right."
+  (agent-shell-chat-mode-tests--with-shell
+    (let ((agent-shell-show-busy-indicator t))
+      (agent-shell-chat-mode-tests--beat 'busy 0)
+      (should (equal (get-text-property 1 'display (agent-shell-chat--live-marker))
+                     '(space :align-to (2 . width)))))))
+
+(ert-deftest agent-shell-chat-busy-frames-accepts-list-test ()
+  "Busy frames can be set as a list as well as a vector."
+  (agent-shell-chat-mode-tests--with-shell
+    (let ((agent-shell-show-busy-indicator t)
+          (agent-shell-chat-busy-frames '("a" "b" "c")))
+      (agent-shell-chat-mode-tests--beat 'busy 4)
+      (should (equal (agent-shell-chat--busy-frame) "b")))))
+
+(ert-deftest agent-shell-chat-live-marker-frame-faced-secondary-test ()
+  "A busy frame is faced `agent-shell-secondary', the marker `default'.
+The frame recedes behind the marker, which stays as it is when idle."
+  (agent-shell-chat-mode-tests--with-shell
+    (let ((agent-shell-show-busy-indicator t))
+      (agent-shell-chat-mode-tests--beat 'busy 0)
+      (let ((marker (agent-shell-chat--live-marker)))
+        (should (eq (get-text-property 0 'face marker) 'agent-shell-secondary))
+        (should (eq (get-text-property (string-match "❯" marker) 'face marker)
+                    'default))))))
+
+(ert-deftest agent-shell-chat-submitted-prompt-stops-animating-test ()
+  "Only the live prompt animates: submitting it leaves no marker to redraw."
+  (agent-shell-chat-mode-tests--with-shell
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (let ((agent-shell-prompt-bar-mode nil)
+          (agent-shell-show-busy-indicator t))
+      (agent-shell-chat-mode-tests--beat 'busy 0)
+      (agent-shell-chat--relabel)
+      ;; Animated once, so the live prompt's overlay is cached.
+      (agent-shell-chat--animate-live-marker)
+      (insert "hello\n")
+      (agent-shell-chat-mode-tests--marker)
+      (agent-shell-chat--relabel)
+      (should-not (seq-find (lambda (overlay)
+                              (overlay-get overlay 'agent-shell-chat--marker-head))
+                            (overlays-in (point-min) (point-max))))
+      (should-not (agent-shell-chat--animate-live-marker)))))
+
+(ert-deftest agent-shell-chat-live-marker-follows-text-above-test ()
+  "The live marker keeps animating as text above it comes and goes.
+The overlay drawing it is cached between ticks, and moves with the text
+around it rather than staying at the position it was found at."
+  (agent-shell-chat-mode-tests--with-shell
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (insert "hello\n")
+    (agent-shell-chat-mode-tests--marker)
+    (insert "reply\n\n")
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (let ((agent-shell-prompt-bar-mode nil)
+          (agent-shell-show-busy-indicator t))
+      (agent-shell-chat-mode-tests--beat 'busy 0)
+      (agent-shell-chat--relabel)
+      (agent-shell-chat--animate-live-marker)
+      (let ((me (car (last (agent-shell-chat-mode-tests--me-overlays)))))
+        ;; Output arriving above the prompt, and some of it removed again.
+        (save-excursion
+          (goto-char (point-min))
+          (insert "streamed above\n"))
+        (save-excursion
+          (goto-char (point-min))
+          (delete-char 9))
+        (agent-shell-chat-mode-tests--beat 'busy 1)
+        (agent-shell-chat--animate-live-marker)
+        (should (equal (overlay-get me 'display)
+                       (agent-shell-chat-mode-tests--busy-marker 1)))
+        ;; Still spanning the tail of the live prompt it was drawn over.
+        (should (string-suffix-p (buffer-substring-no-properties
+                                  (overlay-start me) (overlay-end me))
+                                 "Claude> "))))))
+
+(ert-deftest agent-shell-chat-live-marker-moves-to-next-prompt-test ()
+  "Once a prompt is submitted, the next live prompt's marker animates.
+The cached overlay belongs to the submitted turn by then, and is dropped
+for the new prompt's."
+  (agent-shell-chat-mode-tests--with-shell
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (let ((agent-shell-prompt-bar-mode nil)
+          (agent-shell-show-busy-indicator t))
+      (agent-shell-chat-mode-tests--beat 'busy 0)
+      (agent-shell-chat--relabel)
+      (agent-shell-chat--animate-live-marker)
+      (let ((submitted (car (agent-shell-chat-mode-tests--me-overlays))))
+        (insert "hello\n")
+        (agent-shell-chat-mode-tests--marker)
+        (insert "reply\n\n")
+        (agent-shell-chat-mode-tests--prompt "Claude> ")
+        (agent-shell-chat--relabel)
+        (agent-shell-chat-mode-tests--beat 'busy 1)
+        (agent-shell-chat--animate-live-marker)
+        (let ((live (car (last (agent-shell-chat-mode-tests--me-overlays)))))
+          (should-not (eq live submitted))
+          (should (equal (overlay-get live 'display)
+                         (agent-shell-chat-mode-tests--busy-marker 1)))
+          (should-not (string-match-p "❯" (or (overlay-get submitted 'display) ""))))))))
 
 (ert-deftest agent-shell-chat-submitted-input-first-line-indented-test ()
   "A submitted turn's first input line lines up with the rest of it.

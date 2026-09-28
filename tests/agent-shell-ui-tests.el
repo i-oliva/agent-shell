@@ -235,6 +235,264 @@ Returns the buffer.  Caller must kill it."
           (should (agent-shell-ui-tests--fragment-collapsed-p "ns" "1")))
       (kill-buffer buf))))
 
+;;; isearch
+
+(defun agent-shell-ui-tests--isearch-filter-on (needle)
+  "Run the isearch filter predicate on the first occurrence of NEEDLE.
+Returns the predicate's result.  Errors if NEEDLE is not in the buffer."
+  (save-excursion
+    (goto-char (point-min))
+    (should (search-forward needle nil t))
+    (agent-shell-ui--isearch-filter-predicate (match-beginning 0)
+                                              (match-end 0))))
+
+(ert-deftest agent-shell-ui-isearch-search-invisible-nil-skips-collapsed-test ()
+  "With `search-invisible' nil, hidden matches are rejected and stay hidden.
+Visible matches are still accepted."
+  (let ((buf (agent-shell-ui-tests--make-buffer-with-fragments
+              '(((:namespace-id . "ns") (:block-id . "1")
+                 (:label-left . "label") (:body . "hidden needle"))))))
+    (unwind-protect
+        (with-current-buffer buf
+          (let ((search-invisible nil))
+            (should-not (agent-shell-ui-tests--isearch-filter-on "needle"))
+            (should (agent-shell-ui-tests--fragment-collapsed-p "ns" "1"))
+            (should (agent-shell-ui-tests--isearch-filter-on "label"))))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-ui-isearch-search-invisible-open-expands-collapsed-test ()
+  "With `search-invisible' `open', a hidden match expands its fragment."
+  (let ((buf (agent-shell-ui-tests--make-buffer-with-fragments
+              '(((:namespace-id . "ns") (:block-id . "1")
+                 (:label-left . "label") (:body . "hidden needle"))))))
+    (unwind-protect
+        (with-current-buffer buf
+          (let ((search-invisible 'open))
+            (should (agent-shell-ui-tests--isearch-filter-on "needle"))
+            (should-not (agent-shell-ui-tests--fragment-collapsed-p "ns" "1"))))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-ui-isearch-lazy-highlight-does-not-expand-test ()
+  "Lazy highlight and match counting must not expand fragments.
+They bind `search-invisible' to t or `can-be-opened' while looking
+ahead, never `open', so a hidden match counts but stays collapsed."
+  (let ((buf (agent-shell-ui-tests--make-buffer-with-fragments
+              '(((:namespace-id . "ns") (:block-id . "1")
+                 (:label-left . "label") (:body . "hidden needle"))))))
+    (unwind-protect
+        (with-current-buffer buf
+          (dolist (value '(t can-be-opened))
+            (let ((search-invisible value))
+              (should (agent-shell-ui-tests--isearch-filter-on "needle"))
+              (should (agent-shell-ui-tests--fragment-collapsed-p "ns" "1")))))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-ui-mode-leaves-search-invisible-alone-test ()
+  "`agent-shell-ui-mode' must not shadow the user's `search-invisible'.
+Isearch seeds its per-search setting from it, so a buffer-local
+override would defeat customizing it to nil."
+  (with-temp-buffer
+    (agent-shell-ui-mode 1)
+    (should-not (local-variable-p 'search-invisible))
+    (should (eq isearch-filter-predicate
+                #'agent-shell-ui--isearch-filter-predicate))))
+
+(defun agent-shell-ui-tests--expand-two-fragments-via-isearch ()
+  "Expand both fragments of the current buffer through the isearch filter.
+Leaves point where it started."
+  (let ((search-invisible 'open))
+    (agent-shell-ui-tests--isearch-filter-on "needle one")
+    (agent-shell-ui-tests--isearch-filter-on "needle two")))
+
+(defconst agent-shell-ui-tests--two-needle-fragments
+  '(((:namespace-id . "ns") (:block-id . "1")
+     (:label-left . "first") (:body . "needle one"))
+    ((:namespace-id . "ns") (:block-id . "2")
+     (:label-left . "second") (:body . "needle two")))
+  "Two collapsed fragments, each hiding a distinct needle in its body.")
+
+(ert-deftest agent-shell-ui-isearch-cleanup-keeps-fragment-point-landed-on-test ()
+  "Ending a search folds back what it opened, minus where point landed.
+Collapsing the last fragment too would hide the very hit the user
+searched for the moment the search ends."
+  (let ((buf (agent-shell-ui-tests--make-buffer-with-fragments
+              agent-shell-ui-tests--two-needle-fragments)))
+    (unwind-protect
+        (with-current-buffer buf
+          (agent-shell-ui-tests--expand-two-fragments-via-isearch)
+          (should (equal '("ns-2" "ns-1") agent-shell-ui--isearch-opened-fragments))
+          (goto-char (point-min))
+          (should (search-forward "needle two" nil t))
+          (agent-shell-ui--isearch-cleanup)
+          (should (agent-shell-ui-tests--fragment-collapsed-p "ns" "1"))
+          (should-not (agent-shell-ui-tests--fragment-collapsed-p "ns" "2"))
+          (should-not agent-shell-ui--isearch-opened-fragments))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-ui-isearch-cleanup-folds-all-when-point-left-test ()
+  "A search point walked away from folds everything back.
+`isearch-cancel' returns point to where the search started before
+`isearch-mode-end-hook' runs, so quitting restores every fold."
+  (let ((buf (agent-shell-ui-tests--make-buffer-with-fragments
+              agent-shell-ui-tests--two-needle-fragments)))
+    (unwind-protect
+        (with-current-buffer buf
+          (agent-shell-ui-tests--expand-two-fragments-via-isearch)
+          (goto-char (point-max))
+          (agent-shell-ui--isearch-cleanup)
+          (should (agent-shell-ui-tests--fragment-collapsed-p "ns" "1"))
+          (should (agent-shell-ui-tests--fragment-collapsed-p "ns" "2")))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-ui-isearch-cleanup-leaves-hand-expanded-fragments-test ()
+  "Fragments already open when the search began stay open afterwards.
+The filter only records fragments it had to expand itself."
+  (let ((buf (agent-shell-ui-tests--make-buffer-with-fragments
+              '(((:namespace-id . "ns") (:block-id . "1")
+                 (:label-left . "first") (:body . "needle one")
+                 (:expanded . t))
+                ((:namespace-id . "ns") (:block-id . "2")
+                 (:label-left . "second") (:body . "needle two"))))))
+    (unwind-protect
+        (with-current-buffer buf
+          (agent-shell-ui-tests--expand-two-fragments-via-isearch)
+          (should (equal '("ns-2") agent-shell-ui--isearch-opened-fragments))
+          (goto-char (point-max))
+          (agent-shell-ui--isearch-cleanup)
+          (should-not (agent-shell-ui-tests--fragment-collapsed-p "ns" "1"))
+          (should (agent-shell-ui-tests--fragment-collapsed-p "ns" "2")))
+      (kill-buffer buf))))
+
+(defun agent-shell-ui-tests--make-buffer-with-collapsed-group ()
+  "Create a temp buffer holding a collapsed group of two needle-bearing children.
+Returns the buffer.  Caller must kill it."
+  (let ((buf (generate-new-buffer " *test-ui-group*")))
+    (with-current-buffer buf
+      (agent-shell-ui-mode 1)
+      (dolist (block-id '("t1" "t2"))
+        (agent-shell-ui-update-fragment
+         (agent-shell-ui-make-fragment-model
+          :namespace-id "ns" :block-id block-id
+          :group-id "grp" :group-label "Tools"
+          :label-left "run" :label-right block-id
+          :body (format "needle in %s" block-id))
+         :navigation 'always))
+      (agent-shell-ui-set-group-collapsed-by-id
+       :namespace-id "ns" :block-id "grp" :collapsed t))
+    buf))
+
+(defun agent-shell-ui-tests--text-visible-p (needle)
+  "Return non-nil when the first occurrence of NEEDLE is visible.
+Errors if NEEDLE is not in the buffer."
+  (save-mark-and-excursion
+    (goto-char (point-min))
+    (should (search-forward needle nil t))
+    (not (invisible-p (match-beginning 0)))))
+
+(defun agent-shell-ui-tests--fragment-visible-p (namespace-id block-id)
+  "Return non-nil when NAMESPACE-ID/BLOCK-ID's label line is visible."
+  (let ((qualified-id (format "%s-%s" namespace-id block-id)))
+    (save-mark-and-excursion
+      (goto-char (point-min))
+      (when-let* ((match (text-property-search-forward
+                          'agent-shell-ui-state nil
+                          (lambda (_ state)
+                            (equal (map-elt state :qualified-id) qualified-id))
+                          t)))
+        (not (invisible-p (prop-match-beginning match)))))))
+
+(ert-deftest agent-shell-ui-isearch-expands-owning-group-test ()
+  "A match inside a collapsed group unfolds the group, then the fragment.
+
+Unfolding the child alone clears the `invisible' the group laid over it,
+which drops the body on screen under a header still reading `▶', with
+the child's own label line still hidden.  Siblings the search never
+visited stay folded."
+  (let ((buf (agent-shell-ui-tests--make-buffer-with-collapsed-group)))
+    (unwind-protect
+        (with-current-buffer buf
+          (should-not (agent-shell-ui-tests--text-visible-p "needle in t2"))
+          (let ((search-invisible 'open))
+            (should (agent-shell-ui-tests--isearch-filter-on "needle in t2")))
+          (should (agent-shell-ui-tests--text-visible-p "needle in t2"))
+          (should (agent-shell-ui-tests--fragment-visible-p "ns" "t2"))
+          (should-not (agent-shell-ui-tests--fragment-collapsed-p "ns" "grp"))
+          (should-not (agent-shell-ui-tests--fragment-collapsed-p "ns" "t2"))
+          (should (equal '("ns-t2" "ns-grp")
+                         agent-shell-ui--isearch-opened-fragments))
+          (should (agent-shell-ui-tests--fragment-collapsed-p "ns" "t1"))
+          (should-not (agent-shell-ui-tests--text-visible-p "needle in t1")))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-ui-isearch-cleanup-restores-group-test ()
+  "Ending a search away from the match folds group and child back.
+Refolding the group while leaving the child expanded would spill the
+child's body the next time the group opens."
+  (let ((buf (agent-shell-ui-tests--make-buffer-with-collapsed-group)))
+    (unwind-protect
+        (with-current-buffer buf
+          (let ((search-invisible 'open))
+            (agent-shell-ui-tests--isearch-filter-on "needle in t2"))
+          (should-not (agent-shell-ui-tests--fragment-collapsed-p "ns" "grp"))
+          (should-not (agent-shell-ui-tests--fragment-collapsed-p "ns" "t2"))
+          (goto-char (point-max))
+          (agent-shell-ui--isearch-cleanup)
+          (should (agent-shell-ui-tests--fragment-collapsed-p "ns" "grp"))
+          (should (agent-shell-ui-tests--fragment-collapsed-p "ns" "t2"))
+          (should-not (agent-shell-ui-tests--text-visible-p "needle in t2")))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-ui-isearch-cleanup-keeps-group-of-landed-fragment-test ()
+  "Landing inside a group keeps the group open, not just the fragment.
+Folding the group back would hide the very match the search stopped on."
+  (let ((buf (agent-shell-ui-tests--make-buffer-with-collapsed-group)))
+    (unwind-protect
+        (with-current-buffer buf
+          (let ((search-invisible 'open))
+            (agent-shell-ui-tests--isearch-filter-on "needle in t2"))
+          (goto-char (point-min))
+          (should (search-forward "needle in t2" nil t))
+          (agent-shell-ui--isearch-cleanup)
+          (should-not (agent-shell-ui-tests--fragment-collapsed-p "ns" "grp"))
+          (should-not (agent-shell-ui-tests--fragment-collapsed-p "ns" "t2"))
+          (should (agent-shell-ui-tests--text-visible-p "needle in t2")))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-ui-collapse-expanded-fragment-no-ops-test ()
+  "Collapsing an already collapsed fragment leaves it collapsed.
+Unlike `agent-shell-ui-collapse-fragment-by-id', which would toggle it
+back open.  Unknown ids are ignored."
+  (let ((buf (agent-shell-ui-tests--make-buffer-with-fragments
+              agent-shell-ui-tests--two-needle-fragments)))
+    (unwind-protect
+        (with-current-buffer buf
+          (agent-shell-ui--collapse-expanded-fragment "ns-1")
+          (agent-shell-ui--collapse-expanded-fragment "ns-1")
+          (agent-shell-ui--collapse-expanded-fragment "ns-nope")
+          (should (agent-shell-ui-tests--fragment-collapsed-p "ns" "1"))
+          (should (agent-shell-ui-tests--fragment-collapsed-p "ns" "2")))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-ui-isearch-filter-preserves-match-data-test ()
+  "Expanding an isearch match preserves the search's match data."
+  (let ((buf (agent-shell-ui-tests--make-buffer-with-fragments
+              '(((:namespace-id . "ns") (:block-id . "1")
+                 (:label-left . "A") (:body . "body a"))))))
+    (unwind-protect
+        (with-current-buffer buf
+          (goto-char (point-min))
+          (search-forward "body")
+          (let ((beg (match-beginning 0))
+                (end (match-end 0)))
+            (add-hook 'agent-shell-ui-post-expand-fragment-at-point-hook
+                      (lambda () (string-match "b" "body")) nil t)
+            (let ((search-invisible 'open))
+              (should (agent-shell-ui--isearch-filter-predicate beg end))
+              (should (= beg (match-beginning 0)))
+              (should (= end (match-end 0)))
+              (should-not (agent-shell-ui-tests--fragment-collapsed-p "ns" "1")))))
+      (kill-buffer buf))))
+
 (ert-deftest agent-shell-ui-toggle-survives-surgical-replace-test ()
   "Toggle target stays consistent after `--surgical-replace-body'.
 

@@ -32,6 +32,7 @@
 (require 'map)
 (require 'ring)
 (require 'agent-shell-faces)
+(require 'agent-shell-prompt)
 (eval-when-compile (require 'cl-lib))
 
 (declare-function agent-shell--insert-to-shell-buffer "agent-shell")
@@ -80,10 +81,20 @@ TODO: Remove after 2026-08-28."
   (when-let* ((pending (map-elt agent-shell--state :pending-prompts))
               (next-prompt (car pending)))
     (map-put! agent-shell--state :pending-prompts (cdr pending))
-    (agent-shell--insert-to-shell-buffer
-     :text next-prompt
-     :submit t
-     :no-focus t)))
+    ;; The turn just ended, so the persistent prompt may hold text the user
+    ;; started typing and has not submitted.  Submitting the queued prompt
+    ;; inserts at `point-max', which would put it ahead of that draft and
+    ;; send the two as one message.  Set the draft aside and type it back
+    ;; into the prompt the submission leaves behind.
+    (let ((draft (and agent-shell-persistent-prompt-enabled
+                      (agent-shell--take-prompt-input))))
+      (agent-shell--insert-to-shell-buffer
+       :text next-prompt
+       :submit t
+       :no-focus t)
+      (when draft
+        (goto-char (point-max))
+        (insert draft)))))
 
 (defun agent-shell--prompt-queue-display ()
   "Display pending prompts in the shell buffer if queue is not empty."
@@ -106,7 +117,9 @@ Remove: M-x agent-shell-prompt-queue-remove
                    (mapconcat
                     (lambda (idx-prompt)
                       (let ((idx (cdr idx-prompt))
-                            (first-line (car (split-string (car idx-prompt) "\n" t))))
+                            (first-line (car (split-string
+                                              (substring-no-properties (car idx-prompt))
+                                              "\n" t))))
                         (format "  %d: \"%s\""
                                 (1+ idx)
                                 (truncate-string-to-width first-line 80 nil nil "..."))))
@@ -148,7 +161,9 @@ messages:
                        'face (map-elt row :face))
            "  "
            (truncate-string-to-width
-            (or (car (split-string (map-elt row :prompt) "\n" t)) "")
+            (or (car (split-string
+                      (substring-no-properties (map-elt row :prompt))
+                      "\n" t)) "")
             available nil nil t)))
         (append
          (when active-prompt
@@ -258,6 +273,80 @@ commands when the agent has reported them."
        :state (agent-shell--state)
        :prompt prompt))))
 
+(defcustom agent-shell-busy-submit-default-function
+  #'agent-shell-busy-submit-queue
+  "Function deciding what submitting while the agent is working does.
+
+Called with one argument, the prompt string.  Applies wherever a prompt
+is submitted mid-turn: the shell prompt and the viewport's compose
+buffer alike.
+
+`agent-shell-busy-submit-override-function' is what
+\\[agent-shell-submit-override] reaches for instead, so setting one of
+these to each function makes both available without choosing."
+  :type '(choice (const :tag "Queue until the turn ends" agent-shell-busy-submit-queue)
+                 (const :tag "Steer into the running turn" agent-shell-busy-submit-steer)
+                 (function :tag "Custom function"))
+  :group 'agent-shell)
+
+(defcustom agent-shell-busy-submit-override-function
+  #'agent-shell-busy-submit-steer
+  "Function \\[agent-shell-submit-override] submits through.
+
+Called with one argument, the prompt string, and only when the agent is
+working.  Overrides `agent-shell-busy-submit-default-function' for that
+one submission.
+
+Reached from both surfaces: \\[agent-shell-submit-override] at the shell
+prompt, and \\[agent-shell-viewport-compose-send-override] in the
+viewport's compose buffer, which keeps its own prefix for keeping that
+buffer open."
+  :type '(choice (const :tag "Queue until the turn ends" agent-shell-busy-submit-queue)
+                 (const :tag "Steer into the running turn" agent-shell-busy-submit-steer)
+                 (function :tag "Custom function"))
+  :group 'agent-shell)
+
+(defun agent-shell-busy-submit-queue (prompt)
+  "Queue PROMPT and send it when the running turn ends.
+
+One of the functions `agent-shell-busy-submit-default-function' and
+`agent-shell-busy-submit-override-function' choose between."
+  (agent-shell--prompt-queue-enqueue :prompt prompt))
+
+(defun agent-shell-busy-submit-steer (prompt)
+  "Hand PROMPT to the running turn so the agent can change course.
+
+One of the functions `agent-shell-busy-submit-default-function' and
+`agent-shell-busy-submit-override-function' choose between.
+
+Queues PROMPT instead when the agent cannot steer, which not all can
+\(see `agent-shell-steering-supported-p'), so choosing this does not mean
+an error every turn.  `agent-shell-prompt-steer' is the command that
+refuses outright.
+
+Steering is not additive: see `agent-shell-prompt-steer' for what the
+agent may drop in order to change course."
+  (if (agent-shell-steering-supported-p)
+      (agent-shell-experimental--send-steering
+       :state (agent-shell--state)
+       :prompt prompt)
+    (agent-shell--prompt-queue-enqueue :prompt prompt)))
+
+(cl-defun agent-shell--busy-submit (&key prompt override)
+  "Submit PROMPT into the running turn, however the user has asked for.
+
+Routes through `agent-shell-busy-submit-override-function' when OVERRIDE,
+otherwise `agent-shell-busy-submit-default-function'.  Callers check that
+a turn is running: with none, there is nothing to queue behind or steer
+into, and the prompt is just submitted.
+
+Signals whatever the chosen function signals, so callers holding text the
+user typed can put it back."
+  (funcall (if override
+               agent-shell-busy-submit-override-function
+             agent-shell-busy-submit-default-function)
+           prompt))
+
 (defun agent-shell-prompt-queue (prompt)
   "Queue or immediately send a prompt depending on shell busy state.
 
@@ -266,6 +355,8 @@ resolving it via `agent-shell--shell-buffer' so this works even when
 invoked outside a shell buffer.  If the shell is busy, add PROMPT to the
 pending prompts queue.  Otherwise, submit it immediately.  Queued prompts
 will be automatically sent when the current prompt completes.
+
+Always queues, ignoring `agent-shell-busy-submit-default-function'.
 
 To hand PROMPT to the agent mid-turn instead of waiting, see
 `agent-shell-prompt-steer'.
@@ -313,7 +404,8 @@ either remove all or select a specific prompt to remove."
                       (seq-map-indexed
                        (lambda (prompt idx)
                          (cons (format "%d: %s" (1+ idx)
-                                       (truncate-string-to-width prompt 60 nil nil "..."))
+                                       (truncate-string-to-width
+                                        (substring-no-properties prompt) 60 nil nil "..."))
                                idx))
                        pending)))
             (selection (cdr (assoc (completing-read "Remove: " choices nil t) choices))))
