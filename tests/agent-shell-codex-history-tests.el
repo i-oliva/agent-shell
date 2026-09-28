@@ -23,7 +23,7 @@
            (page (agent-shell-history-test--page "recent" "older"))
            (response (list (cons '_meta (list (cons agent-shell-codex-history--meta-key page)))))
            (called nil))
-      (cl-letf (((symbol-function 'agent-shell-codex-history--insert-link) #'ignore))
+      (cl-letf (((symbol-function 'agent-shell-history--insert-link) #'ignore))
         (agent-shell-codex-history--send-request-a
          (lambda (&rest args)
            (should (= 40 (map-nested-elt (plist-get args :request)
@@ -33,7 +33,7 @@
          :on-success (lambda (value) (setq called (eq value response)))))
       (should called)
       (should (equal request original))
-      (should (eq agent-shell-codex-history--page page))
+      (should (eq agent-shell-history--page page))
       (should (= 1 (length (agent-shell--pop-pending-restore agent-shell--state)))))))
 
 (ert-deftest agent-shell-history-unmodified-adapter-fallback-test ()
@@ -55,7 +55,7 @@
        :request (acp-make-session-load-request :session-id "s1" :cwd "/tmp")
        :on-success (lambda (_) (setq called t)))
       (should called)
-      (should-not agent-shell-codex-history--page)
+      (should-not agent-shell-history--page)
       (should (= 1 (length (agent-shell--pop-pending-restore agent-shell--state)))))))
 
 (defun agent-shell-history-test--reader (body)
@@ -69,9 +69,9 @@
             (map-put! (map-elt agent-shell--state :session) :id "s1"))
           (with-temp-buffer
             (agent-shell-codex-history-mode)
-            (setq agent-shell-codex-history--source source
-                  agent-shell-codex-history--session-id "s1"
-                  agent-shell-codex-history--pages
+            (setq agent-shell-history--source source
+                  agent-shell-history--session-id "s1"
+                  agent-shell-history--pages
                   (list (agent-shell-history-test--page "recent" "older")))
             (agent-shell-codex-history--render-page)
             (funcall body source)))
@@ -92,7 +92,7 @@
                     (funcall (plist-get args :on-success)
                              (agent-shell-history-test--page "older text" nil)))))
          (agent-shell-codex-history-older)
-         (should (= agent-shell-codex-history--index 1))
+         (should (= agent-shell-history--index 1))
          (should (string-match-p "older text" (buffer-string)))
          (agent-shell-codex-history-newer)
          (should (string-match-p "recent" (buffer-string)))
@@ -117,12 +117,12 @@
                         (funcall (plist-get args :on-success)
                                  (agent-shell-history-test--page "retry worked" nil))))))
            (agent-shell-codex-history-older)
-           (should-not agent-shell-codex-history--loading)
-           (should (string-match-p "disconnected" agent-shell-codex-history--error))
-           (should (= agent-shell-codex-history--index 0))
+           (should-not agent-shell-history--loading)
+           (should (string-match-p "disconnected" agent-shell-history--error))
+           (should (= agent-shell-history--index 0))
            (agent-shell-codex-history-older)
-           (should-not agent-shell-codex-history--error)
-           (should (= agent-shell-codex-history--index 1))))))))
+           (should-not agent-shell-history--error)
+           (should (= agent-shell-history--index 1))))))))
 
 (ert-deftest agent-shell-history-rejects-stale-session-response-test ()
   "A response after the source session changes must not enter the reader."
@@ -135,9 +135,9 @@
        (with-current-buffer source
          (map-put! (map-elt agent-shell--state :session) :id "s2"))
        (funcall callback (agent-shell-history-test--page "wrong session" nil))
-       (should (= 1 (length agent-shell-codex-history--pages)))
-       (should-not agent-shell-codex-history--loading)
-       (should (string-match-p "source session changed" agent-shell-codex-history--error))))))
+       (should (= 1 (length agent-shell-history--pages)))
+       (should-not agent-shell-history--loading)
+       (should (string-match-p "source session changed" agent-shell-history--error))))))
 
 (ert-deftest agent-shell-history-rejects-cursor-loop-test ()
   "Repeated cursors do not append duplicate pages or trap the reader loading."
@@ -148,9 +148,9 @@
                   (funcall (plist-get args :on-success)
                            (agent-shell-history-test--page "duplicate" "older")))))
        (agent-shell-codex-history-older))
-     (should-not agent-shell-codex-history--loading)
-     (should (= 1 (length agent-shell-codex-history--pages)))
-     (should (string-match-p "repeated" agent-shell-codex-history--error)))))
+     (should-not agent-shell-history--loading)
+     (should (= 1 (length agent-shell-history--pages)))
+     (should (string-match-p "repeated" agent-shell-history--error)))))
 
 (ert-deftest agent-shell-history-ignores-superseded-response-test ()
   "A reopened reader ignores callbacks for its previous request."
@@ -160,9 +160,9 @@
        (cl-letf (((symbol-function 'acp-send-request)
                   (lambda (&rest args) (setq callback (plist-get args :on-success)))))
          (agent-shell-codex-history-older))
-       (setq agent-shell-codex-history--request-token (list t))
+       (setq agent-shell-history--request-token (list t))
        (funcall callback (agent-shell-history-test--page "stale" nil))
-       (should (= 1 (length agent-shell-codex-history--pages)))))))
+       (should (= 1 (length agent-shell-history--pages)))))))
 
 (ert-deftest agent-shell-history-tool-raw-output-test ()
   "Saved commands retain complete input and output without content blocks."
@@ -180,7 +180,7 @@
                                (cons 'rawOutput raw-output)))
                  (print-length 1)
                  (print-level 1))
-            (setq agent-shell-codex-history--pages
+            (setq agent-shell-history--pages
                   (list (list '(version . 1) (cons 'updates (vector update)))))
             (agent-shell-codex-history--render-page)
             (dolist (text (list "Input" input "Output" output))

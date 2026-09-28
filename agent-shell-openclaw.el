@@ -29,6 +29,7 @@
   (require 'cl-lib))
 (require 'acp)
 (require 'agent-shell)
+(require 'agent-shell-history)
 
 (declare-function agent-shell--dwim "agent-shell")
 (declare-function agent-shell--make-acp-client "agent-shell")
@@ -101,6 +102,25 @@ Returns an agent configuration alist using `agent-shell-make-agent-config'."
 ;;; Local add-on on top of upstream agent-shell: expose OpenClaw in the agent
 ;;; picker once this file is loaded.
 (add-to-list 'agent-shell-agent-configs #'agent-shell-openclaw-make-agent-config)
+
+(defun agent-shell-openclaw--load-error-a (original &rest args)
+  "Keep a failed OpenClaw restore in its selected conversation.
+ORIGINAL receives the request keyword ARGS."
+  (let ((state (plist-get args :state))
+        (request (plist-get args :request)))
+    (when (and (eq (map-nested-elt state '(:agent-config :identifier)) 'openclaw)
+               (member (map-elt request :method) '("session/load" "session/resume")))
+      (let ((handler (agent-shell--make-error-handler
+                      :state state :shell-buffer (map-elt state :buffer))))
+        (setq args
+              (plist-put args :on-failure
+                         (lambda (err raw)
+                           (map-put! state :pending-restore nil)
+                           (funcall handler err raw))))))
+    (apply original args)))
+
+(unless (advice-member-p #'agent-shell-openclaw--load-error-a 'agent-shell--send-request)
+  (advice-add 'agent-shell--send-request :around #'agent-shell-openclaw--load-error-a))
 
 (provide 'agent-shell-openclaw)
 
