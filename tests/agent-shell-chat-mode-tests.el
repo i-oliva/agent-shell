@@ -1,6 +1,7 @@
 ;;; agent-shell-chat-mode-tests.el --- Tests for agent-shell-chat-mode -*- lexical-binding: t; -*-
 
 (require 'ert)
+(require 'cl-lib)
 (require 'agent-shell-chat-mode)
 
 ;;; Code:
@@ -817,6 +818,38 @@ which would leave relabeling holding an overlay with no buffer."
     (should (= 1 (length (agent-shell-chat-mode-tests--me-overlays))))
     (should (= 1 (length (agent-shell-chat-mode-tests--agent-overlays))))))
 
+(ert-deftest agent-shell-chat-relabels-after-fragment-test ()
+  "A fragment rendered above the live prompt shows without an event.
+
+It lands at the prompt's start, inside the label overlay starting there,
+whose `display' draws the label in its place.  A notice like a declined
+steer fires no event, so it stayed hidden until something else relabeled
+\(agent-shell-js#47)."
+  (with-temp-buffer
+    (setq-local agent-shell--state '((:agent-config . ((:mode-line-name . "Claude"))))
+                agent-shell-chat-mode t)
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (insert "hello\n")
+    (agent-shell-chat-mode-tests--marker)
+    (insert "reply\n\n")
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (let ((agent-shell-prompt-bar-mode nil)
+          (shown (lambda ()
+                   (agent-shell-chat--displayed-substring (point-min) (point-max)))))
+      (cl-letf (((symbol-function 'agent-shell-subscribe-to) #'ignore)
+                ((symbol-function 'agent-shell-unsubscribe) #'ignore))
+        (agent-shell-chat--enable)
+        (save-excursion
+          (goto-char (- (point-max) (length "Claude> ")))
+          (insert "Note: declined.\n\n"))
+        (should-not (string-match-p "declined" (funcall shown)))
+        (run-hook-with-args 'agent-shell-section-functions nil)
+        (should (timerp agent-shell-chat--relabel-timer))
+        (cancel-timer agent-shell-chat--relabel-timer)
+        (agent-shell-chat--relabel-buffer (current-buffer))
+        (should (string-match-p "declined" (funcall shown)))
+        (agent-shell-chat--disable)))))
+
 (ert-deftest agent-shell-chat-absorbs-leading-blank-lines-test ()
   "A submitted prompt's overlay swallows the input's leading blank lines."
   (agent-shell-chat-mode-tests--with-shell
@@ -869,11 +902,11 @@ so it does not vanish mid-type when a relabel runs."
 
 (defun agent-shell-chat-mode-tests--busy-marker (beat)
   "Return the live marker as drawn on BEAT while busy.
-Read from `agent-shell-chat-busy-frames', so the frames can change
+Read from `agent-shell-prompt-busy-frames', so the frames can change
 without these tests.
 
 For example, on beat 1 returns \"/ ❯ \"."
-  (concat (seq-elt agent-shell-chat-busy-frames beat) " " agent-shell-chat--prompt))
+  (concat (seq-elt agent-shell-prompt-busy-frames beat) " " agent-shell-chat--prompt))
 
 (ert-deftest agent-shell-chat-live-marker-animates-while-busy-test ()
   "A busy agent animates the live prompt's marker, a frame per beat.
@@ -928,13 +961,47 @@ would otherwise push the marker right."
       (should (equal (get-text-property 1 'display (agent-shell-chat--live-marker))
                      '(space :align-to (2 . width)))))))
 
-(ert-deftest agent-shell-chat-busy-frames-accepts-list-test ()
+(ert-deftest agent-shell-prompt-busy-frames-accepts-list-test ()
   "Busy frames can be set as a list as well as a vector."
   (agent-shell-chat-mode-tests--with-shell
     (let ((agent-shell-show-busy-indicator t)
-          (agent-shell-chat-busy-frames '("a" "b" "c")))
+          (agent-shell-prompt-busy-frames '("a" "b" "c")))
       (agent-shell-chat-mode-tests--beat 'busy 4)
       (should (equal (agent-shell-chat--busy-frame) "b")))))
+
+(ert-deftest agent-shell-prompt-busy-frames-accepts-string-test ()
+  "Busy frames set as a string show as is on every beat."
+  (agent-shell-chat-mode-tests--with-shell
+    (let ((agent-shell-show-busy-indicator t)
+          (agent-shell-prompt-busy-frames "busy"))
+      (agent-shell-chat-mode-tests--beat 'busy 0)
+      (should (equal (agent-shell-chat--busy-frame) "busy"))
+      (agent-shell-chat-mode-tests--beat 'busy 3)
+      (should (equal (agent-shell-chat--busy-frame) "busy")))))
+
+(ert-deftest agent-shell-prompt-busy-frames-accepts-function-test ()
+  "Busy frames can come from a function, returning a string or frames."
+  (agent-shell-chat-mode-tests--with-shell
+    (let ((agent-shell-show-busy-indicator t)
+          (agent-shell-prompt-busy-frames (lambda () "connecting")))
+      (agent-shell-chat-mode-tests--beat 'busy 3)
+      (should (equal (agent-shell-chat--busy-frame) "connecting"))
+      (setq agent-shell-prompt-busy-frames (lambda () '("a" "b")))
+      (should (equal (agent-shell-chat--busy-frame) "b"))
+      (setq agent-shell-prompt-busy-frames #'ignore)
+      (should-not (agent-shell-chat--busy-frame)))))
+
+(ert-deftest agent-shell-chat-live-marker-spaces-wide-frame-test ()
+  "A frame wider than a column is followed by a plain space, not aligned.
+It can't fit the body indent, so aligning would leave no space before
+the marker."
+  (agent-shell-chat-mode-tests--with-shell
+    (let ((agent-shell-show-busy-indicator t)
+          (agent-shell-prompt-busy-frames "busy"))
+      (agent-shell-chat-mode-tests--beat 'busy 0)
+      (let ((marker (agent-shell-chat--live-marker)))
+        (should (equal (substring-no-properties marker) "busy ❯ "))
+        (should-not (get-text-property 4 'display marker))))))
 
 (ert-deftest agent-shell-chat-live-marker-frame-faced-secondary-test ()
   "A busy frame is faced `agent-shell-secondary', the marker `default'.

@@ -104,6 +104,7 @@ We now have a handful of additional packages to extend the =agent-shell= experie
 - [[https://github.com/Jamie-Cui/agent-shell-permission-transient][agent-shell-permission-transient]]: A compact Transient interface for responding to queued agent-shell permission requests.
 - [[https://github.com/tychoish/agent-shell-queue][agent-shell-queue]]: A flexible prompt/shell queue for =agent-shell= sessions.
 - [[https://github.com/mrcnski/agent-shell-queue-transient][agent-shell-queue-transient]]: A Transient interface for the prompt queue in =agent-shell=.
+- [[https://github.com/izeigerman/agent-shell-gc][agent-shell-gc]]: Garbage collection for =agent-shell=.
 
 * Articles
 - 20Y: [[https://20y.hu/~slink/journal/agent-shell/index.html][Agentic development workflow in Emacs]]
@@ -808,7 +809,7 @@ The viewport's compose buffer is available either way, and submitting from it mi
 
 *** Steering a running turn
 
-A prompt sent while the agent is working is queued and submitted once the turn ends.  Agents that support steering can take it into the turn already running instead, so a wrong direction can be corrected without waiting for it to finish.  Steering is an ACP extension (=_session/steering=) rather than part of the spec, advertised by the agent at initialization: the Claude and Codex packages implement it, other agents keep queueing.
+A prompt sent while the agent is working is queued and submitted once the turn ends.  Prompts queued during the same turn are merged into a single prompt, separated by blank lines (set =agent-shell-prompt-queue-merge= to nil to send them one turn each).  Cancelling the turn asks whether to continue with the queued prompts.  Agents that support steering can take it into the turn already running instead, so a wrong direction can be corrected without waiting for it to finish.  Steering is an ACP extension (=_session/steering=) rather than part of the spec, advertised by the agent at initialization: the Claude and Codex packages implement it, other agents keep queueing.
 
 Steering is always explicit.  =M-x agent-shell-prompt-queue= queues, as it always has.  =M-x agent-shell-prompt-steer= steers the running turn, and errors when the agent cannot steer.  With no turn running there is nothing to steer into, so it submits the prompt instead.  When the agent declines a steer, the running turn is interrupted and the shell says so, rather than letting the agent carry on in a direction you believe you already corrected.
 
@@ -862,6 +863,29 @@ configurations across every agent that you use.
            (type . "http")
            (headers . [])
            (url . "https://mcp.notion.com/mcp"))))
+#+end_src
+
+*** Monitoring events
+
+You can subscribe to shell events (turn complete, tool calls, config changes, etc.) via =agent-shell-subscribe-to=. See its docstring (=C-h f agent-shell-subscribe-to=) for the full list of events and their data.
+
+For example, to have new OpenCode shells remember the last model and effort level chosen (within your Emacs session):
+
+#+begin_src emacs-lisp
+  (add-hook 'agent-shell-mode-hook
+            (lambda ()
+              (agent-shell-subscribe-to
+               :shell-buffer (current-buffer)
+               :event 'config-option-update
+               :on-event
+               (lambda (event)
+                 (pcase (map-elt (agent-shell-get-config (current-buffer)) :identifier)
+                   ('opencode
+                    (setq agent-shell-opencode-default-config-options
+                          (seq-map (lambda (option)
+                                     (cons (map-elt option :id)
+                                           (map-elt option :current-value)))
+                                   (map-nested-elt event '(:data :config-options))))))))))
 #+end_src
 
 ** Running agents in Devcontainers / Docker containers (Experimental)
@@ -1109,7 +1133,7 @@ always go to Evil modes if you need to with ~C-z~).
 | agent-shell-droid-default-session-mode-id     | Default Droid AI session mode ID.                                               |
 | agent-shell-droid-environment                 | Environment variables for the Factory Droid ACP client.                         |
 | agent-shell-embed-file-size-limit             | Maximum file size in bytes for embedding with ContentBlock::Resource.           |
-| agent-shell-file-completion-enabled           | Non-nil automatically enables file completion when starting shells.             |
+| agent-shell-file-completion-enabled           | Non-nil enables ‘agent-shell-completion-mode’ when starting shells.             |
 | agent-shell-file-display-action               | Display action for files opened from a link, image, or ‘@file’ mention.         |
 | agent-shell-github-acp-command                | Command and parameters for the GitHub Copilot agent client.                     |
 | agent-shell-github-default-model-id           | Default GitHub Copilot model ID.                                                |
@@ -1153,6 +1177,7 @@ always go to Evil modes if you need to with ~C-z~).
 | agent-shell-openai-authentication             | Configuration for OpenAI authentication.                                        |
 | agent-shell-openai-codex-acp-command          | Command and parameters for the OpenAI Codex client.                             |
 | agent-shell-openai-codex-environment          | Environment variables for the OpenAI Codex client.                              |
+| agent-shell-openai-default-config-options     | Default Codex config options, applied at session start.                         |
 | agent-shell-openai-default-model-id           | Default Codex model ID.                                                         |
 | agent-shell-openai-default-session-mode-id    | Default Codex session mode ID.                                                  |
 | agent-shell-opencode-acp-command              | Command and parameters for the OpenCode client.                                 |
@@ -1169,6 +1194,7 @@ always go to Evil modes if you need to with ~C-z~).
 | agent-shell-pi-environment                    | Environment variables for the Pi client.                                        |
 | agent-shell-prefer-viewport-interaction       | Non-nil makes ‘agent-shell’ prefer viewport interaction over shell interaction. |
 | agent-shell-preferred-agent-config            | Default agent to use for all new shells.                                        |
+| agent-shell-prompt-busy-frames                | Frames animating the live prompt’s marker while the agent works.                |
 | agent-shell-qoder-acp-command                 | Command and parameters for the Qoder CLI ACP server.                            |
 | agent-shell-qoder-environment                 | Environment variables for the Qoder CLI ACP server.                             |
 | agent-shell-qwen-acp-command                  | Command and parameters for the Qwen Code client.                                |
@@ -1257,7 +1283,7 @@ always go to Evil modes if you need to with ~C-z~).
 |                                                       | agent-shell-clear-buffer                                | Clear the current shell buffer.                                               |
 |                                                       | agent-shell-cline-start-agent                           | Start an interactive Cline agent shell.                                       |
 |                                                       | agent-shell-codebuddy-start-agent                       | Start an interactive CodeBuddy agent shell.                                   |
-|                                                       | agent-shell-completion-mode                             | Toggle agent shell completion with @ or / prefix.                             |
+|                                                       | agent-shell-completion-mode                             | Toggle popping completion as @ or / are typed.                                |
 |                                                       | agent-shell-copy-as-markdown                            | Copy the region between BEG and END to the kill ring as markdown.             |
 |                                                       | agent-shell-copy-last-output                            | Copy the last agent output to the kill ring.                                  |
 |                                                       | agent-shell-copy-link-url-at-point                      | Copy the rendered Markdown link URL at POS (or point) to the kill ring.       |

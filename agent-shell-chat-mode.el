@@ -47,6 +47,7 @@
   (require 'subr-x))
 
 (defvar agent-shell-prompt-queue-setup-minibuffer-functions)
+(defvar agent-shell-section-functions)
 
 (declare-function agent-shell-subscribe-to "agent-shell")
 (declare-function agent-shell-unsubscribe "agent-shell")
@@ -70,17 +71,34 @@ overridden the next time a shell starts."
   :type 'boolean
   :group 'agent-shell)
 
-(defvar agent-shell-chat-busy-frames
-  ["|" "/" "-" "\\"]
+(defcustom agent-shell-prompt-busy-frames
+  '("|" "/" "-" "\\")
   "Frames animating the live prompt's marker while the agent works.
-A vector or list of strings, each a single column, drawn in the body
-indent ahead of the marker.  For example, [\"·\" \"•\" \"●\" \"•\"].
+A list or vector of strings, drawn in the body indent ahead of the
+marker, a string shown as is, without animating, or a function
+returning either (or nil to show nothing).  For example,
+\\='(\"·\" \"•\" \"●\" \"•\") or \"(busy)\".
+
+A function takes no arguments and is called in the shell buffer on
+every heartbeat tick, so keep it cheap.  For example, to show
+\"(connecting)\" until the session starts, and \"(busy)\" after:
+
+  (lambda ()
+    (if (agent-shell-session-id) \"(busy)\" \"(connecting)\"))
+
+The body indent fits a single column, so a wider frame (like \"(busy)\")
+is followed by a plain space, pushing the marker right while the agent
+works.
 
 ASCII by default, so the buffer's own font draws them.  Anything a font
 may lack comes from a fallback font instead, which can draw it wider
 than a column or with a taller line, bouncing the prompt as frames
 change.  Braille, the usual spinner, is one such (and may show unraised
-dots).")
+dots)."
+  :type '(choice (string :tag "Static text")
+                 (repeat :tag "Frames" string)
+                 (function :tag "Function"))
+  :group 'agent-shell)
 
 ;;; Constants
 
@@ -140,12 +158,18 @@ returns \" Me \" in that face."
 (defun agent-shell-chat--busy-frame ()
   "Return the busy frame for the heartbeat's current beat, or nil when idle.
 
-For example, on the heartbeat's third beat returns \"-\"."
+For example, on the heartbeat's third beat returns \"-\".  With
+`agent-shell-prompt-busy-frames' set to a string, or to a function
+returning one, returns that string on every beat."
   (when-let* (((bound-and-true-p agent-shell-show-busy-indicator))
               (heartbeat (map-elt agent-shell--state :heartbeat))
-              ((eq (map-elt heartbeat :status) 'busy)))
-    (seq-elt agent-shell-chat-busy-frames
-             (mod (map-elt heartbeat :value) (seq-length agent-shell-chat-busy-frames)))))
+              ((eq (map-elt heartbeat :status) 'busy))
+              (frames (if (functionp agent-shell-prompt-busy-frames)
+                          (funcall agent-shell-prompt-busy-frames)
+                        agent-shell-prompt-busy-frames)))
+    (if (stringp frames)
+        frames
+      (seq-elt frames (mod (map-elt heartbeat :value) (seq-length frames))))))
 
 (defun agent-shell-chat--live-marker ()
   "Return the live prompt's marker, animated while the agent works.
@@ -156,13 +180,17 @@ frame faced `agent-shell-secondary' so it recedes behind the marker.
 A frame's glyph can come from a fallback font wider than a column, so
 the space after it aligns the marker to the body indent rather than
 trusting the frame's width.  Aligned in units of the buffer's own font,
-which unlike bare columns follow `text-scale-adjust'."
+which unlike bare columns follow `text-scale-adjust'.  A frame wider
+than a column (like \"(busy)\") can't fit the indent, so a plain space
+follows it instead."
   (if-let* ((frame (agent-shell-chat--busy-frame)))
       (concat (propertize frame 'face 'agent-shell-secondary)
-              (propertize (concat (propertize " " 'display
-                                              `(space :align-to
-                                                      (,(string-width agent-shell-chat--body-indent)
-                                                       . width)))
+              (propertize (concat (if (> (string-width frame) 1)
+                                      " "
+                                    (propertize " " 'display
+                                                `(space :align-to
+                                                        (,(string-width agent-shell-chat--body-indent)
+                                                         . width))))
                                   agent-shell-chat--prompt)
                           'face 'default))
     (propertize (concat agent-shell-chat--body-indent agent-shell-chat--prompt)
@@ -1072,8 +1100,9 @@ flips between hidden and `Me' immediately across all shells."
 Deferred so the triggering change's own text properties (e.g. the prompt
 face shell-maker applies after inserting) are in place; coalesced so a
 burst yields a single relabel.  Runs from the event subscription (which
-covers submissions, streaming, turn completion and `session-restored')
-and from `shell-maker-finish-output-hook' (which covers `clear')."
+covers submissions, streaming, turn completion and `session-restored'),
+`shell-maker-finish-output-hook' (`clear') and
+`agent-shell-section-functions' (fragments rendered with no event)."
   (when (and agent-shell-chat--labeled
              (not agent-shell-chat--relabel-timer))
     (setq agent-shell-chat--relabel-timer
@@ -1125,7 +1154,9 @@ relabel tracks submissions, streaming responses, turn completion and
 reloads (`session-restored'), and adds a buffer-local
 `shell-maker-finish-output-hook' so `clear' and the other internal
 commands (which reprint the prompt with no `agent-shell' event) relabel
-too."
+too.  A buffer-local `agent-shell-section-functions' relabels after
+fragments rendered with no event, which the live prompt's label would
+otherwise hide."
   (unless agent-shell-chat--labeled
     (setq-local agent-shell-chat--labeled t)
     (agent-shell-chat--relabel)
@@ -1135,12 +1166,16 @@ too."
                  :on-event #'agent-shell-chat--schedule-relabel))
     (add-hook 'shell-maker-finish-output-hook
               #'agent-shell-chat--schedule-relabel nil t)
+    (add-hook 'agent-shell-section-functions
+              #'agent-shell-chat--schedule-relabel nil t)
     (add-hook 'agent-shell-prompt-queue-setup-minibuffer-functions
               #'agent-shell-chat--decorate-queued-prompt)))
 
 (defun agent-shell-chat--disable ()
-  "Remove chat labels, subscription, timer and hook from the current buffer."
+  "Remove chat labels, subscription, timer and hooks from the current buffer."
   (remove-hook 'shell-maker-finish-output-hook
+               #'agent-shell-chat--schedule-relabel t)
+  (remove-hook 'agent-shell-section-functions
                #'agent-shell-chat--schedule-relabel t)
   (when agent-shell-chat--subscription
     (agent-shell-unsubscribe :subscription agent-shell-chat--subscription))

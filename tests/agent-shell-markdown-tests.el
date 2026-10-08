@@ -133,6 +133,59 @@
                   (agent-shell-markdown-convert "Echo _hello_world"))
                  '(("Echo _hello_world" nil)))))
 
+(ert-deftest agent-shell-markdown-convert-italic-lone-asterisks ()
+  (should (equal (agent-shell-markdown--deconstruct
+                  (agent-shell-markdown-convert "a * b * c"))
+                 '(("a * b * c" nil)))))
+
+(ert-deftest agent-shell-markdown-convert-italic-asterisk-before-inline-code ()
+  (should (equal (agent-shell-markdown--deconstruct
+                  (agent-shell-markdown-convert
+                   "Started with * and ended with `*`"))
+                 '(("Started with * and ended with " nil)
+                   ("*" (agent-shell-markdown-inline-code))))))
+
+(ert-deftest agent-shell-markdown-convert-italic-closing-inside-inline-code ()
+  (should (equal (agent-shell-markdown--deconstruct
+                  (agent-shell-markdown-convert "a *b `c*` d"))
+                 '(("a *b " nil)
+                   ("c*" (agent-shell-markdown-inline-code))
+                   (" d" nil)))))
+
+(ert-deftest agent-shell-markdown-convert-bold-wrapping-inline-code ()
+  ;; Emphasis wholly enclosing a code span still renders; only a span
+  ;; reaching into code (see the tests around this one) is rejected.
+  (should (equal (agent-shell-markdown--deconstruct
+                  (agent-shell-markdown-convert "a **`b`:** c"))
+                 '(("a " nil)
+                   ("b" (agent-shell-markdown-inline-code agent-shell-markdown-bold))
+                   (":" (agent-shell-markdown-bold))
+                   (" c" nil)))))
+
+(ert-deftest agent-shell-markdown-convert-italic-wrapping-inline-code ()
+  (should (equal (agent-shell-markdown--deconstruct
+                  (agent-shell-markdown-convert "a *see `b`* c"))
+                 '(("a " nil)
+                   ("see " (agent-shell-markdown-italic))
+                   ("b" (agent-shell-markdown-inline-code agent-shell-markdown-italic))
+                   (" c" nil)))))
+
+(ert-deftest agent-shell-markdown-convert-bold-closing-inside-inline-code ()
+  (should (equal (agent-shell-markdown--deconstruct
+                  (agent-shell-markdown-convert "a **b `c**` d"))
+                 '(("a **b " nil)
+                   ("c**" (agent-shell-markdown-inline-code))
+                   (" d" nil)))))
+
+(ert-deftest agent-shell-markdown-convert-italic-around-inline-code ()
+  (should (equal (agent-shell-markdown--deconstruct
+                  (agent-shell-markdown-convert "a *b* `c` d"))
+                 '(("a " nil)
+                   ("b" (agent-shell-markdown-italic))
+                   (" " nil)
+                   ("c" (agent-shell-markdown-inline-code))
+                   (" d" nil)))))
+
 (ert-deftest agent-shell-markdown-convert-multiple ()
   (should (equal (agent-shell-markdown--deconstruct
                   (agent-shell-markdown-convert "_my_ **text**"))
@@ -2199,7 +2252,7 @@ Outro"))))
   ;; no framing blank line is added at the buffer edges.
   (with-temp-buffer
     (insert "| a | b |\n|---|---|\n| 1 | 2 |")
-    (agent-shell-markdown-replace-markup)
+    (agent-shell-markdown-replace-markup :complete t)
     (should (equal (substring-no-properties (buffer-string))
                    "│ a │ b │
 ├───┼───┤
@@ -2372,33 +2425,31 @@ Outro"))))
                      "• one\n• two\n")))))
 
 (ert-deftest agent-shell-markdown-list-items-not-split-when-rendered-separately ()
-  ;; Regression: streaming under a body narrow renders a last item early
-  ;; (before its trailing newline arrives), so that newline lands
+  ;; Regression: a complete render under a body narrow renders a last
+  ;; item before its trailing newline arrives, so that newline lands
   ;; untagged between two rendered list lines, splitting the list into
   ;; two runs.  Framing must still treat them as one block and not
   ;; strand a blank between the items.  The body narrow here excludes a
-  ;; trailing newline (as a fragment body does), which is what triggers
-  ;; the early render.
+  ;; trailing newline, as a fragment body does.
   (let ((agent-shell-markdown-list-bullets '("•")))
     (with-temp-buffer
       (insert "- one\n")
       (save-restriction (narrow-to-region (point-min) (1- (point-max)))
-                        (agent-shell-markdown-replace-markup))
+                        (agent-shell-markdown-replace-markup :complete t))
       (goto-char (1- (point-max)))
       (insert "\n- two")
       (save-restriction (narrow-to-region (point-min) (1- (point-max)))
-                        (agent-shell-markdown-replace-markup))
+                        (agent-shell-markdown-replace-markup :complete t))
       (should (equal (substring-no-properties (buffer-string))
                      "• one\n• two\n")))))
 
 (ert-deftest agent-shell-markdown-list-item-not-split-when-line-streams-in-parts ()
-  ;; Regression: a chunk can end mid-item, so the last-line handler
-  ;; renders that item before its whole line has streamed in; its
-  ;; rendered span ends partway through the line and the rest arrives
-  ;; untagged.  Framing must still fold the item's whole line into the
-  ;; block and not strand a blank between it and the next item.  Uses a
-  ;; body narrow (excluding a trailing newline) to trigger the early
-  ;; render, and splits item one mid-line like the real stream did.
+  ;; Regression: a chunk can end mid-item.  Framing must fold the
+  ;; item's whole line into the block once it completes, and not strand
+  ;; a blank between it and the next item, rendered when the stream
+  ;; completes.  Uses a body narrow (excluding a trailing newline), as a
+  ;; fragment body does, and splits item one mid-line like the real
+  ;; stream did.
   (let ((agent-shell-markdown-list-bullets '("•")))
     (with-temp-buffer
       (insert "\n")
@@ -2409,7 +2460,7 @@ Outro"))))
       (goto-char (1- (point-max)))
       (insert "rest)\n- two")
       (save-restriction (narrow-to-region (point-min) (1- (point-max)))
-                        (agent-shell-markdown-replace-markup))
+                        (agent-shell-markdown-replace-markup :complete t))
       (should (equal (substring-no-properties
                       (buffer-substring (point-min) (1- (point-max))))
                      "• one (rest)\n• two")))))
@@ -2472,19 +2523,14 @@ Outro"))))
       (should (equal (substring-no-properties (buffer-string))
                      "intro\n\n• A\n• B\n\nafter\n")))))
 
-(ert-deftest agent-shell-markdown-list-last-line-renders-under-narrow ()
-  ;; Regression: a fragment body is rendered narrowed to its content, so
-  ;; a list item on the last line has its terminating newline just
-  ;; outside the narrow.  The newline-anchored pass would leave that last
-  ;; item raw; it must still render, since a newline exists right past
-  ;; the narrow (the line is complete).
+(ert-deftest agent-shell-markdown-list-last-line-renders-when-complete ()
+  ;; Regression: a response ending in a list item with no newline after
+  ;; it.  The newline-anchored pass leaves that last item raw, so a
+  ;; render marked complete (nothing more is coming) must render it.
   (let ((agent-shell-markdown-list-bullets '("•")))
     (with-temp-buffer
-      (insert "Sources:\n\n- First item\n- Last item\n")
-      (save-restriction
-        ;; Narrow to the body, excluding the last item's trailing newline.
-        (narrow-to-region (point-min) (1- (point-max)))
-        (agent-shell-markdown-replace-markup))
+      (insert "Sources:\n\n- First item\n- Last item")
+      (agent-shell-markdown-replace-markup :complete t)
       (goto-char (point-max))
       (search-backward "Last item")
       (goto-char (line-beginning-position))
@@ -2493,6 +2539,29 @@ Outro"))))
       ;; Source is stashed whole, so copy-as-markdown round-trips.
       (should (equal (get-text-property (point) 'agent-shell-markdown-source)
                      "- Last item")))))
+
+(ert-deftest agent-shell-markdown-list-last-line-raw-under-padded-narrow ()
+  ;; Regression for issue #867: a fragment body is rendered narrowed,
+  ;; with the fragment's padding newlines just past the narrow.  Those
+  ;; say nothing about the body's last line, so an item there stays raw
+  ;; while streaming.  Rendering it early stashed `- **Bold' as its
+  ;; source, and the rest of the line streaming in after was lost from
+  ;; copy-as-markdown.
+  (let ((agent-shell-markdown-list-bullets '("•")))
+    (with-temp-buffer
+      (insert "- **Bold\n\n")
+      (save-restriction
+        (narrow-to-region (point-min) (- (point-max) 2))
+        (agent-shell-markdown-replace-markup)
+        (goto-char (point-min))
+        (should (eq (char-after) ?-))
+        (goto-char (point-max))
+        (insert " lead:** Normal text.\n")
+        (agent-shell-markdown-replace-markup)
+        (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                       "• Bold lead: Normal text.\n"))
+        (should (equal (agent-shell-markdown-reconstruct (point-min) (point-max))
+                       "- **Bold lead:** Normal text.\n"))))))
 
 (ert-deftest agent-shell-markdown-list-last-line-raw-while-streaming ()
   ;; The last line with no newline anywhere after it is a still-streaming
@@ -3037,12 +3106,17 @@ returns (agent-shell-markdown-table agent-shell-markdown-table-zebra)."
   ;; The header, border and zebra faces all resolve through
   ;; `agent-shell-markdown-table', which is what lets a face-remapping
   ;; setup pin a whole table by naming that one face.  It comes last in
-  ;; each inherit list, so a face's own styling still wins.
+  ;; the header and zebra inherit lists, so their own styling still
+  ;; wins, but first in the border's, so a font a theme sets on
+  ;; `font-lock-comment-face' can't size borders apart from the cells
+  ;; (issue #868).
   (dolist (face '(agent-shell-markdown-table-header
-                  agent-shell-markdown-table-border
                   agent-shell-markdown-table-zebra))
     (should (equal (seq-drop (face-attribute face :inherit) 1)
-                   '(agent-shell-markdown-table)))))
+                   '(agent-shell-markdown-table))))
+  (should (equal (car (face-attribute 'agent-shell-markdown-table-border
+                                      :inherit))
+                 'agent-shell-markdown-table)))
 
 (ert-deftest agent-shell-markdown-table-sizes-against-destination-window ()
   ;; Regression: column allocation must size against the table's
@@ -3131,6 +3205,45 @@ returns (agent-shell-markdown-table agent-shell-markdown-table-zebra)."
 │ 2 │ Bob   │ Designer │ UK      │ Historical │
 "))))
 
+(ert-deftest agent-shell-markdown-table-styles-markup-split-across-row-chunks ()
+  ;; A chunk ending at a cell's `|' (`| Commit |') looks like a whole
+  ;; row.  Rendering it then would commit the rest of the row as raw
+  ;; continuation chunks, so a link or inline code split across two of
+  ;; them would never be styled and its raw markup would widen the
+  ;; column (issue #868).
+  (dolist (chunks '(("| A | B |\n|---|---|\n| x | y |\n| Commit |"
+                     " [abc" "](https://github.com/x" "yz) |\n")
+                    ("| A | B |\n|---|---|\n| x | y |\n| Code |"
+                     " `(require 'init-org" ")` |\n")))
+    (with-temp-buffer
+      (dolist (chunk chunks)
+        (goto-char (point-max))
+        (insert chunk)
+        (agent-shell-markdown-replace-markup))
+      (should (equal (substring-no-properties (buffer-string))
+                     (with-temp-buffer
+                       (insert (apply #'concat chunks))
+                       (agent-shell-markdown-replace-markup)
+                       (substring-no-properties (buffer-string))))))))
+
+(ert-deftest agent-shell-markdown-table-keeps-styling-refontified-while-pending ()
+  ;; A row styled while it waits for its newline can be re-fontified
+  ;; before it folds into the table, clearing `face' and leaving only
+  ;; the mirrored `font-lock-face'.  The table must still pick up the
+  ;; styling (issue #868).
+  (with-temp-buffer
+    (dolist (chunk '("| A | B |\n|---|---|\n| x | y |\n| S |" " ~~old~~ |" "\n"))
+      (goto-char (point-max))
+      (insert chunk)
+      (agent-shell-markdown-replace-markup)
+      ;; What re-fontification does to `face' between chunks.
+      (remove-text-properties (point-min) (point-max) '(face nil)))
+    (goto-char (point-min))
+    (search-forward "old")
+    (should (memq 'agent-shell-markdown-strikethrough
+                  (ensure-list (get-text-property (match-beginning 0)
+                                                  'font-lock-face))))))
+
 (ert-deftest agent-shell-markdown-table-inside-open-fence-stays-raw ()
   ;; A table inside a fenced block whose closing fence hasn't
   ;; streamed in yet must NOT get table-rendered.  Otherwise the
@@ -3151,9 +3264,10 @@ returns (agent-shell-markdown-table agent-shell-markdown-table-zebra)."
     (should-not (string-match-p "│" (buffer-string)))))
 
 (ert-deftest agent-shell-markdown-table-renders-final-row-without-trailing-newline ()
-  ;; A complete table whose last row isn't terminated by `\n' (e.g.
-  ;; the final chunk of a streaming response) must still render —
-  ;; callers like agent-shell narrow to the body section, which
+  ;; A table whose last row isn't terminated by `\n' (e.g. the final
+  ;; chunk of a streaming response) leaves that row raw while more
+  ;; text may follow, and renders it once the render is complete.
+  ;; Callers like agent-shell narrow to the body section, which
   ;; excludes the trailing `\n', so even when streaming has stopped
   ;; the row would appear unterminated within the narrow.
   (with-temp-buffer
@@ -3162,6 +3276,12 @@ returns (agent-shell-markdown-table agent-shell-markdown-table-zebra)."
 | Alice | 28 |
 | Bob | 35 |")
     (agent-shell-markdown-replace-markup)
+    (should (equal (substring-no-properties (buffer-string))
+                   "│ Name  │ Age │
+├───────┼─────┤
+│ Alice │ 28  │
+| Bob | 35 |"))
+    (agent-shell-markdown-replace-markup :complete t)
     (should (equal (substring-no-properties (buffer-string))
                    "│ Name  │ Age │
 ├───────┼─────┤
@@ -3741,6 +3861,30 @@ A " nil)
                               'face 'agent-shell-markdown-blockquote)))
     (should (eq (get-text-property (+ (point-min) 2) 'face)
                 'agent-shell-markdown-blockquote))))
+
+(ert-deftest agent-shell-markdown-blockquote-renders-last-line-when-complete ()
+  ;; A response ending on a quoted line never gets its newline, so a
+  ;; complete render must not hold that line back.
+  (with-temp-buffer
+    (insert "> a\n>\n> b")
+    (agent-shell-markdown-replace-markup)
+    (should-not (get-text-property (- (point-max) 3) 'display))
+    (agent-shell-markdown-replace-markup :complete t)
+    (should (equal (substring-no-properties (buffer-string)) "> a\n>\n> b"))
+    (should (equal (get-text-property (- (point-max) 3) 'display)
+                   (propertize "▌" 'face 'agent-shell-markdown-blockquote)))
+    (should (eq (get-text-property (1- (point-max)) 'face)
+                'agent-shell-markdown-blockquote))))
+
+(ert-deftest agent-shell-markdown-header-renders-last-line-when-complete ()
+  (with-temp-buffer
+    (insert "Intro\n\n## Title")
+    (agent-shell-markdown-replace-markup)
+    (should (equal (substring-no-properties (buffer-string)) "Intro\n\n## Title"))
+    (agent-shell-markdown-replace-markup :complete t)
+    (should (equal (agent-shell-markdown--deconstruct (buffer-string))
+                   '(("Intro\n\n" nil)
+                     ("Title" (agent-shell-markdown-header-2)))))))
 
 (ert-deftest agent-shell-markdown-blockquote-inside-fence-stays-raw ()
   ;; A `>'-prefixed line inside a fenced code block must not be
