@@ -1,4 +1,4 @@
-;;; agent-shell-openclaw.el --- OpenClaw agent configuration -*- lexical-binding: t; -*-
+;;; agent-shell-openclaw.el --- OpenClaw agent configurations -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2024 Alvaro Ramirez
 
@@ -20,43 +20,53 @@
 
 ;;; Commentary:
 ;;
-;; This file includes OpenClaw-specific configuration.
+;; This file includes OpenClaw-specific configurations.
 ;;
 
 ;;; Code:
 
 (eval-when-compile
   (require 'cl-lib))
+(require 'shell-maker)
 (require 'acp)
-(require 'agent-shell)
 (require 'agent-shell-history)
+(defvar agent-shell-context-sources)
 
-(declare-function agent-shell--dwim "agent-shell")
-(declare-function agent-shell--make-acp-client "agent-shell")
+(declare-function agent-shell--indent-string "agent-shell")
+(declare-function agent-shell-welcome-message "agent-shell")
 (declare-function agent-shell-make-agent-config "agent-shell")
 (autoload 'agent-shell-make-agent-config "agent-shell")
-(defvar agent-shell-context-sources)
+(declare-function agent-shell--make-acp-client "agent-shell")
+(declare-function agent-shell--dwim "agent-shell")
 
 (defcustom agent-shell-openclaw-acp-command
   '("openclaw" "acp")
-  "Command and parameters for the OpenClaw ACP client.
+  "Command and parameters for the OpenClaw ACP bridge.
 
 The first element is the command name, and the rest are command parameters."
   :type '(repeat string)
   :group 'agent-shell)
 
+(defcustom agent-shell-openclaw-default-model-id
+  nil
+  "Default OpenClaw model ID.
+
+Must be one of the model ID's displayed under \"Available models\"
+when starting a new shell."
+  :type '(choice (const nil) string)
+  :group 'agent-shell)
+
 (defcustom agent-shell-openclaw-environment
   nil
-  "Environment variables for the OpenClaw ACP client.
+  "Environment variables for the OpenClaw client.
 
 This should be a list of environment variables to be used when
-starting the OpenClaw ACP client process.  Use this for Gateway
-authentication variables or proxy settings when needed.
+starting the OpenClaw client process.
 
 Example usage to set custom environment variables:
 
   (setq agent-shell-openclaw-environment
-        (agent-shell-make-environment-variables
+        (`agent-shell-make-environment-variables'
          \"MY_VAR\" \"some-value\"
          \"MY_OTHER_VAR\" \"another-value\"))"
   :type '(repeat string)
@@ -72,20 +82,18 @@ Returns an agent configuration alist using `agent-shell-make-agent-config'."
    :buffer-name "OpenClaw"
    :shell-prompt "OpenClaw> "
    :shell-prompt-regexp "OpenClaw> "
+   :welcome-function #'agent-shell-openclaw--welcome-message
+   :icon-name "openclaw.png"
    :client-maker (lambda (buffer)
                    (agent-shell-openclaw-make-client :buffer buffer))
-   :install-instructions "Install OpenClaw and configure an OpenClaw Gateway; see https://docs.openclaw.ai/start/wizard and https://docs.openclaw.ai/cli/acp."))
+   :default-model-id (lambda () agent-shell-openclaw-default-model-id)
+   :install-instructions "See https://docs.openclaw.ai/start/getting-started for installation."))
 
+;;;###autoload
 (defun agent-shell-openclaw-start-agent ()
   "Start an interactive OpenClaw agent shell."
   (interactive)
-  ;; OpenClaw receives prompts through a Gateway and can faithfully answer any
-  ;; text sent as part of the ACP prompt.  Avoid the most surprising DWIM source
-  ;; here: the current line.  In Doom/which-key workflows, leader-key popups can
-  ;; briefly make UI hint text look like the current line, which then pollutes
-  ;; the first OpenClaw prompt.  Keep this override OpenClaw-specific:
-  ;; the observed integration issue was OpenClaw's prompt echo/current-line
-  ;; interaction, and any shared DWIM policy can be revisited separately.
+  ;; Keep leader-key popup text out of the initial Gateway prompt.
   (let ((agent-shell-context-sources '(files region error)))
     (agent-shell--dwim :config (agent-shell-openclaw-make-agent-config)
                        :new-shell t)))
@@ -99,9 +107,29 @@ Returns an agent configuration alist using `agent-shell-make-agent-config'."
                                 :environment-variables agent-shell-openclaw-environment
                                 :context-buffer buffer))
 
-;;; Local add-on on top of upstream agent-shell: expose OpenClaw in the agent
-;;; picker once this file is loaded.
-(add-to-list 'agent-shell-agent-configs #'agent-shell-openclaw-make-agent-config)
+(defun agent-shell-openclaw--welcome-message (config)
+  "Return OpenClaw welcome message using `shell-maker' CONFIG."
+  (let ((art (agent-shell--indent-string 4 (agent-shell-openclaw--ascii-art)))
+        (message (agent-shell-welcome-message config)))
+    (concat "\n\n"
+            art
+            "\n\n"
+            message)))
+
+(defun agent-shell-openclaw--ascii-art ()
+  "OpenClaw ASCII art."
+  (let* ((is-dark (eq (frame-parameter nil 'background-mode) 'dark))
+         (text (string-trim "
+ ██████╗  ██████╗  ███████╗ ███╗   ██╗  ██████╗ ██╗       █████╗  ██╗    ██╗
+██╔═══██╗ ██╔══██╗ ██╔════╝ ████╗  ██║ ██╔════╝ ██║      ██╔══██╗ ██║    ██║
+██║   ██║ ██████╔╝ █████╗   ██╔██╗ ██║ ██║      ██║      ███████║ ██║ █╗ ██║
+██║   ██║ ██╔═══╝  ██╔══╝   ██║╚██╗██║ ██║      ██║      ██╔══██║ ██║███╗██║
+╚██████╔╝ ██║      ███████╗ ██║ ╚████║ ╚██████╗ ███████╗ ██║  ██║ ╚███╔███╔╝
+ ╚═════╝  ╚═╝      ╚══════╝ ╚═╝  ╚═══╝  ╚═════╝ ╚══════╝ ╚═╝  ╚═╝  ╚══╝╚══╝
+" "\n")))
+    (propertize text 'font-lock-face (if is-dark
+                                         '(:foreground "#FF5A2D" :inherit fixed-pitch)
+                                       '(:foreground "#D14A22" :inherit fixed-pitch)))))
 
 (defun agent-shell-openclaw--load-error-a (original &rest args)
   "Keep a failed OpenClaw restore in its selected conversation.

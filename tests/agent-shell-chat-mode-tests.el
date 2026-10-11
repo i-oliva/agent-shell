@@ -43,9 +43,7 @@ ME itself where the run has no newline above to carry it."
                                                   (line-beginning-position))
                                   (overlay-start me)))
                     (lambda (a b) (< (overlay-start a) (overlay-start b))))))
-    (cond (rows (mapconcat (lambda (overlay)
-                             (or (overlay-get overlay 'display) ""))
-                           rows ""))
+    (cond (rows (mapconcat #'agent-shell-chat-mode-tests--row-string rows ""))
           ((seq-some (lambda (overlay)
                        (and (eq (overlay-get overlay 'agent-shell-chat--tag) 'me-label)
                             (= (overlay-end overlay) (overlay-start me))
@@ -78,6 +76,13 @@ there."
               (eq (overlay-get overlay 'agent-shell-chat--tag) 'me-draft))
             (overlays-in (point-min) (point-max))))
 
+(defun agent-shell-chat-mode-tests--row-string (overlay)
+  "Return the label row OVERLAY draws, as it renders.
+A row is normally a `display', but one holding an image is drawn as a
+`before-string' instead (see `agent-shell-chat--row-props')."
+  (concat (or (overlay-get overlay 'before-string) "")
+          (or (overlay-get overlay 'display) "")))
+
 (defun agent-shell-chat-mode-tests--label-row-p (overlay)
   "Return non-nil when OVERLAY draws a row of a label.
 A label is drawn a row to each buffer position, as a `display'.  An
@@ -108,7 +113,7 @@ whole there instead."
                                   (overlay-start agent)))
                     (lambda (a b) (< (overlay-start a) (overlay-start b))))))
     (if rows
-        (mapconcat (lambda (overlay) (or (overlay-get overlay 'display) "")) rows "")
+        (mapconcat #'agent-shell-chat-mode-tests--row-string rows "")
       (overlay-get agent 'before-string))))
 
 (defun agent-shell-chat-mode-tests--agent-overlays ()
@@ -251,6 +256,50 @@ without an `agent-shell-chat--tag' are left alone."
   (with-temp-buffer
     (setq-local agent-shell--state nil)
     (should (equal "Agent" (agent-shell-chat--agent-name)))))
+
+(ert-deftest agent-shell-chat-boxed-label-test ()
+  "The default label pads its text and faces it by role."
+  (let ((me (agent-shell-chat--boxed-label '((:text . "Me") (:role . user))))
+        (agent (agent-shell-chat--boxed-label '((:text . "Claude") (:role . agent)))))
+    (should (equal " Me " me))
+    (should (eq 'agent-shell-chat-me-label (get-text-property 0 'face me)))
+    (should (equal " Claude " agent))
+    (should (eq 'agent-shell-chat-agent-label (get-text-property 0 'face agent)))))
+
+(ert-deftest agent-shell-chat-label-function-test ()
+  "Labels are drawn by `agent-shell-chat-label-function'."
+  (let* ((labels nil)
+         (agent-shell-chat-label-function
+          (lambda (label)
+            (push label labels)
+            (format "<%s>" (map-elt label :text)))))
+    (agent-shell-chat-mode-tests--with-shell
+      (agent-shell-chat-mode-tests--prompt "Claude> ")
+      (insert "hello\n")
+      (agent-shell-chat-mode-tests--marker)
+      (insert "hi there\n")
+      (agent-shell-chat--relabel)
+      (should (member '((:text . "Me") (:role . user)) labels))
+      (should (member '((:text . "Claude") (:role . agent)) labels))
+      (should (string-match-p
+               "<Me>" (agent-shell-chat-mode-tests--label-string
+                       (car (agent-shell-chat-mode-tests--me-overlays)))))
+      (should (string-match-p
+               "<Claude>" (agent-shell-chat-mode-tests--agent-label-string
+                           (car (agent-shell-chat-mode-tests--agent-overlays))))))))
+
+(ert-deftest agent-shell-chat-row-props-test ()
+  "A row holding a `display' is drawn as a `before-string'."
+  (should (equal '((display . " Me \n") (before-string . ""))
+                 (agent-shell-chat--row-props " Me \n")))
+  (let ((row (concat (propertize " Me " 'display '(space :width 4)) "\n")))
+    (should (equal "\n"
+                   (map-elt (agent-shell-chat--row-props row) 'display)))
+    (should (equal " Me "
+                   (map-elt (agent-shell-chat--row-props row) 'before-string))))
+  (let ((row (propertize " Me " 'display '(space :width 4))))
+    (should (equal ""
+                   (map-elt (agent-shell-chat--row-props row) 'display)))))
 
 (ert-deftest agent-shell-chat-labels-submitted-turn-test ()
   "A submitted turn boxes the prompt as `Me' and the response as the agent."

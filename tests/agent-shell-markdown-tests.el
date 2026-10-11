@@ -36,6 +36,28 @@
                   (agent-shell-markdown-convert "**let vs let\\***"))
                  '(("let vs let*" (agent-shell-markdown-bold))))))
 
+(ert-deftest agent-shell-markdown-delimiter-in-code-inside-bold ()
+  ;; Regression: the `*' inside `let*' is code, not a closing delimiter,
+  ;; so it must not stop the surrounding bold span from matching.
+  (should (equal (agent-shell-markdown--deconstruct
+                  (agent-shell-markdown-convert "**`let` vs `let*`:** the drain"))
+                 '(("let" (agent-shell-markdown-inline-code agent-shell-markdown-bold))
+                   (" vs " (agent-shell-markdown-bold))
+                   ("let*" (agent-shell-markdown-inline-code agent-shell-markdown-bold))
+                   (":" (agent-shell-markdown-bold))
+                   (" the drain" nil)))))
+
+(ert-deftest agent-shell-markdown-delimiter-in-code-inside-emphasis ()
+  ;; Same as above for italic, underscore bold and strike-through.
+  (should (equal (substring-no-properties
+                  (agent-shell-markdown-convert
+                   "*a `b*` c* __d `e_f` g__ ~~h `i~~j` k~~"))
+                 "a b* c d e_f g h i~~j k"))
+  ;; A delimiter only inside code is still not emphasis on its own.
+  (should (equal (substring-no-properties
+                  (agent-shell-markdown-convert "a `**` b `**` c"))
+                 "a ** b ** c")))
+
 (ert-deftest agent-shell-markdown-escaped-punctuation-not-markup ()
   ;; A backslash-escaped delimiter renders as the bare char with no
   ;; emphasis: `\\_' stays `_', `\\*' stays `*'.
@@ -243,6 +265,36 @@
                  '(("a " nil)
                    ("code" (agent-shell-markdown-inline-code))
                    (" b" nil)))))
+
+(ert-deftest agent-shell-markdown-convert-inline-code-double-backticks ()
+  ;; Regression: a span opened by `` closes on the next `` only, so
+  ;; single backticks inside are body text, and one padding space is
+  ;; stripped from each side.
+  (should (equal (agent-shell-markdown--deconstruct
+                  (agent-shell-markdown-convert "swallow whole `` `code` `` spans"))
+                 '(("swallow whole " nil)
+                   ("`code`" (agent-shell-markdown-inline-code))
+                   (" spans" nil))))
+  (should (equal (agent-shell-markdown--deconstruct
+                  (agent-shell-markdown-convert "a ``b`c`` d"))
+                 '(("a " nil)
+                   ("b`c" (agent-shell-markdown-inline-code))
+                   (" d" nil))))
+  ;; An all-space body keeps its spaces.
+  (should (equal (agent-shell-markdown--deconstruct
+                  (agent-shell-markdown-convert "a `  ` b"))
+                 '(("a " nil)
+                   ("  " (agent-shell-markdown-inline-code))
+                   (" b" nil))))
+  (should (equal (agent-shell-markdown-tests--roundtrip
+                  "swallow whole `` `code` `` spans\n")
+                 "swallow whole `` `code` `` spans\n")))
+
+(ert-deftest agent-shell-markdown-convert-inline-code-double-backticks-protect-markup ()
+  ;; The body of a `` span is protected from the markup passes too.
+  (should (equal (substring-no-properties
+                  (agent-shell-markdown-convert "a `` `**b**` `` c"))
+                 "a `**b**` c")))
 
 (ert-deftest agent-shell-markdown-convert-strikethrough ()
   (should (equal (agent-shell-markdown--deconstruct

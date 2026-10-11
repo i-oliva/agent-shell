@@ -699,6 +699,17 @@ bold `let vs let*', still stashing `**let vs let\\***' for copy."
                       (point) 'agent-shell-markdown-escaped nil (point-max))
                      (point-max))))))
 
+(rx-define agent-shell-markdown--emphasis-content (delimiters)
+  ;; Emphasis content: chars other than newline, backtick or
+  ;; DELIMITERS, or whole `code' spans, which may hold any of
+  ;; DELIMITERS since code spans bind tighter than emphasis.  The two
+  ;; branches are disjoint (only the second starts with a backtick), so
+  ;; a line full of backticks cannot backtrack exponentially.  A lone
+  ;; backtick matches neither, but the unclosed-backtick avoid-range
+  ;; would block the span anyway.
+  (or (not (any "\n`" delimiters))
+      (seq "`" (zero-or-more (not (any "\n`"))) "`")))
+
 (cl-defun agent-shell-markdown--replace-bolds (&key avoid-ranges)
   "Replace `**X**' / `__X__' spans in current buffer with bold X.
 
@@ -706,7 +717,8 @@ Markup characters are deleted; remaining inner text carries face
 `agent-shell-markdown-bold' layered on top of any existing face
 properties.  Spans that fall inside or reach into any of AVOID-RANGES
 are left untouched.  Returns non-nil if at least one replacement was
-made.
+made.  A delimiter inside a `code' span within X does not end the span,
+so \"**`let*` form**\" is bold.
 
 For example, the buffer \"hello **world**.\" becomes \"hello
 world.\" with face `agent-shell-markdown-bold' on \"world\"."
@@ -716,8 +728,12 @@ world.\" with face `agent-shell-markdown-bold' on \"world\"."
     (while (re-search-forward
             (rx (or line-start (syntax whitespace))
                 (group
-                 (or (seq "**" (group (one-or-more (not (any "\n*")))) "**")
-                     (seq "__" (group (one-or-more (not (any "\n_")))) "__")))
+                 (or (seq "**" (group (one-or-more
+                                       (agent-shell-markdown--emphasis-content "*")))
+                          "**")
+                     (seq "__" (group (one-or-more
+                                       (agent-shell-markdown--emphasis-content "_")))
+                          "__")))
                 (or (syntax punctuation) (syntax whitespace) line-end))
             nil t)
       (let* ((markup-start (match-beginning 1))
@@ -763,15 +779,17 @@ world.\" with face `agent-shell-markdown-italic' on \"world\"."
     (while (re-search-forward
             (rx (or (seq (or bol (one-or-more (any "\n \t")))
                          (group "*"
-                                (group (not (any "\n\t *"))
-                                       (optional (zero-or-more (not (any "\n*")))
-                                                 (not (any "\n\t *"))))
+                                (group (agent-shell-markdown--emphasis-content "\t *")
+                                       (optional (zero-or-more
+                                                  (agent-shell-markdown--emphasis-content "*"))
+                                                 (agent-shell-markdown--emphasis-content "\t *")))
                                 "*"))
                     (seq (or bol (one-or-more (any "\n \t")))
                          (group "_"
-                                (group (not (any "\n\t _"))
-                                       (optional (zero-or-more (not (any "\n_")))
-                                                 (not (any "\n\t _"))))
+                                (group (agent-shell-markdown--emphasis-content "\t _")
+                                       (optional (zero-or-more
+                                                  (agent-shell-markdown--emphasis-content "_"))
+                                                 (agent-shell-markdown--emphasis-content "\t _")))
                                 "_")
                          (or (syntax punctuation) (syntax whitespace) line-end))))
             nil t)
@@ -808,7 +826,9 @@ For example, the buffer \"a ~~b~~ c\" becomes \"a b c\" with face
         (changed nil))
     (goto-char (point-min))
     (while (re-search-forward
-            (rx "~~" (group (one-or-more (not (any "\n~")))) "~~")
+            (rx "~~" (group (one-or-more
+                             (agent-shell-markdown--emphasis-content "~")))
+                "~~")
             nil t)
       (let* ((markup-start (match-beginning 0))
              (markup-end (match-end 0))
@@ -914,38 +934,49 @@ of them but one: `agent-shell-markdown--linkify-file-references' links
 a `path:line' citation in here, adding properties without reading the
 body as markup, so what the tag is for survives.
 
+Spans may be delimited by any run of backticks, closed by a run of
+the same length, so the body can hold shorter runs: the buffer
+\"a `` `x` `` b\" faces \"`x`\".  As in CommonMark, one space is
+stripped from each side of a body that both starts and ends with a
+space (unless it is all spaces).
+
 For example, the buffer \"a `code` b\" becomes \"a code b\" with
 face `agent-shell-markdown-inline-code' on \"code\"."
   (let ((case-fold-search nil))
     (goto-char (point-min))
-    (while (re-search-forward "`\\([^`\n]+\\)`" nil t)
-      (let* ((markup-start (match-beginning 0))
-             (markup-end (match-end 0))
-             (avoid (agent-shell-markdown-in-avoid-range-p
-                     markup-start markup-end avoid-ranges)))
-        (if avoid
-            (goto-char (cdr avoid))
-          (let ((source (unless (get-text-property markup-start
-                                                   'agent-shell-markdown-source)
-                          (agent-shell-markdown-reconstruct
-                           markup-start markup-end))))
-            ;; Delete the two backticks where they stand rather than the
-            ;; span as a whole: the `:inline-code-ranges' every later pass
-            ;; avoids this body through are markers into it, and deleting
-            ;; the span collapses them onto a single point.  The body would
-            ;; then read as ordinary prose, rendering `[title](url)' inside
-            ;; backticks as a link instead of the literal text asked for.
-            (delete-region (1- markup-end) markup-end)
-            (delete-region markup-start (1+ markup-start))
-            (let ((end (- markup-end 2)))
-              (add-face-text-property markup-start end 'agent-shell-markdown-inline-code)
-              (add-text-properties markup-start end
-                                   '(agent-shell-markdown-frozen t
-                                                                 rear-nonsticky (agent-shell-markdown-frozen)))
-              (when source
-                (put-text-property markup-start end
-                                   'agent-shell-markdown-source source))
-              (goto-char end))))))))
+    (while-let ((span (agent-shell-markdown--next-code-span
+                       :avoid-ranges avoid-ranges)))
+      (when-let* ((markup-start (map-elt span :start))
+                  (markup-end (map-elt span :end)))
+        (let* ((padding (if (string-match-p
+                             "\\` .*[^ ].* \\'"
+                             (buffer-substring-no-properties
+                              (map-elt span :body-start) (map-elt span :body-end)))
+                            1
+                          0))
+               (body-start (+ (map-elt span :body-start) padding))
+               (body-end (- (map-elt span :body-end) padding))
+               (source (unless (get-text-property markup-start
+                                                  'agent-shell-markdown-source)
+                         (agent-shell-markdown-reconstruct
+                          markup-start markup-end))))
+          ;; Delete the delimiters where they stand rather than the
+          ;; span as a whole: the `:inline-code-ranges' every later pass
+          ;; avoids this body through are markers into it, and deleting
+          ;; the span collapses them onto a single point.  The body would
+          ;; then read as ordinary prose, rendering `[title](url)' inside
+          ;; backticks as a link instead of the literal text asked for.
+          (delete-region body-end markup-end)
+          (delete-region markup-start body-start)
+          (let ((end (+ markup-start (- body-end body-start))))
+            (add-face-text-property markup-start end 'agent-shell-markdown-inline-code)
+            (add-text-properties markup-start end
+                                 '(agent-shell-markdown-frozen t
+                                                               rear-nonsticky (agent-shell-markdown-frozen)))
+            (when source
+              (put-text-property markup-start end
+                                 'agent-shell-markdown-source source))
+            (goto-char end)))))))
 
 (cl-defun agent-shell-markdown--link-markup-regexp (&key as-image?)
   "Return a regexp matching link (or image, when AS-IMAGE?) markup.
@@ -5330,14 +5361,67 @@ range is still left alone (see `agent-shell-markdown--linkify-url')."
                       limit))))
     (nreverse ranges)))
 
+(cl-defun agent-shell-markdown--next-backtick-run (&key bound avoid-ranges)
+  "Return the next backtick run after point as (START . END), or nil.
+
+Searches up to BOUND (default `point-max'), skipping runs inside
+AVOID-RANGES, and leaves point after the run returned.
+
+For example, in the buffer \"a ``b\" from `point-min' this returns
+the range covering \"``\"."
+  (let ((run nil))
+    (while (and (not run)
+                (re-search-forward "`+" bound t))
+      (if-let* ((avoid (agent-shell-markdown-in-avoid-range-p
+                        (match-beginning 0) (match-beginning 0) avoid-ranges)))
+          (goto-char (max (point) (min (cdr avoid) (or bound (point-max)))))
+        (setq run (cons (match-beginning 0) (match-end 0)))))
+    run))
+
+(cl-defun agent-shell-markdown--next-code-span (&key bound avoid-ranges)
+  "Return the next inline code span after point as an alist, or nil.
+
+The opening backtick run is searched for up to BOUND (default
+`point-max'), skipping runs inside AVOID-RANGES.  As in CommonMark, it
+is closed by the next run of the same length on its line; runs of
+other lengths are part of the body, so `` `x` `` holds \"`x`\" (the
+padding spaces included).  The result is
+
+  ((:start . START) (:body-start . BODY-START)
+   (:body-end . BODY-END) (:end . END))
+
+where START..END spans the whole construct and BODY-START..BODY-END
+the text between the runs.  An opening run with no closer has
+`:body-end' and `:end' nil.  Point is left after the closing run, or
+after the opening run when unclosed.
+
+For example, in the buffer \"a `b` c\" from `point-min' this returns
+START 3, BODY-START 4, BODY-END 5 and END 6."
+  (when-let* ((opener (agent-shell-markdown--next-backtick-run
+                       :bound bound :avoid-ranges avoid-ranges)))
+    (let ((width (- (cdr opener) (car opener)))
+          (closer nil))
+      (while-let (((not closer))
+                  (run (agent-shell-markdown--next-backtick-run
+                        :bound (line-end-position) :avoid-ranges avoid-ranges)))
+        (when (= (- (cdr run) (car run)) width)
+          (setq closer run)))
+      (unless closer
+        (goto-char (cdr opener)))
+      (list (cons :start (car opener))
+            (cons :body-start (cdr opener))
+            (cons :body-end (car closer))
+            (cons :end (cdr closer))))))
+
 (cl-defun agent-shell-markdown--inline-code-ranges (&key avoid-ranges)
   "Return list of (start . end) ranges covering inline `X` bodies.
 
-Each range covers the text between backticks (the backticks
-themselves are not included).  Backticks inside any of
-AVOID-RANGES are ignored.  A line with an odd number of backticks
-has its trailing unmatched backtick treated as still-streaming:
-the range extends from that backtick to end-of-line.
+Each range covers the text between the delimiting backtick runs (the
+backticks themselves are not included); see
+`agent-shell-markdown--next-code-span' for how runs pair up.
+Backticks inside any of AVOID-RANGES are ignored.  A backtick run
+with no closing run on its line is treated as still-streaming: the
+range extends from that run to end-of-line.
 
 Exception: on a table row (a line beginning with `|') an unmatched
 backtick only extends to the next `|', since a code span cannot
@@ -5354,22 +5438,21 @@ one range covering the body \"code\"."
         (let ((line-beg (line-beginning-position))
               (line-end (line-end-position))
               (open nil))
-          (while (re-search-forward "`" line-end t)
-            (let ((pos (match-beginning 0)))
-              (unless (agent-shell-markdown-in-avoid-range-p pos pos avoid-ranges)
-                (if open
-                    (progn
-                      (push (cons (1+ open) pos) ranges)
-                      (setq open nil))
-                  (setq open pos)))))
+          (while-let (((not open))
+                      (span (agent-shell-markdown--next-code-span
+                             :bound line-end :avoid-ranges avoid-ranges)))
+            (if (map-elt span :end)
+                (push (cons (map-elt span :body-start) (map-elt span :body-end))
+                      ranges)
+              (setq open (map-elt span :body-start))))
           (when open
-            (push (cons (1+ open)
+            (push (cons open
                         (if (save-excursion
                               (goto-char line-beg)
                               (looking-at-p
                                agent-shell-markdown--table-pending-line-regexp))
                             (save-excursion
-                              (goto-char (1+ open))
+                              (goto-char open)
                               (if (search-forward "|" line-end t)
                                   (1- (point))
                                 line-end))

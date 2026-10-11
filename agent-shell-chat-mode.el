@@ -100,6 +100,24 @@ dots)."
                  (function :tag "Function"))
   :group 'agent-shell)
 
+(defcustom agent-shell-chat-label-function #'agent-shell-chat--boxed-label
+  "Function returning a chat label (\"Me\" or the agent's name).
+
+Called with an alist, for example:
+
+  \\='((:text . \"Me\")
+    (:role . user))
+
+:role is `user' for the \"Me\" label and `agent' for the agent's.
+
+Should return a single-line string, propertized as the label is to be
+drawn.  A `display' property is honored, so the label can be drawn as an
+image (e.g. an SVG badge).
+
+See `agent-shell-chat--boxed-label' for the default."
+  :type 'function
+  :group 'agent-shell)
+
 ;;; Constants
 
 (defconst agent-shell-chat--prompt "❯ "
@@ -146,14 +164,50 @@ A hint only: see `agent-shell-chat--find-live-marker-overlay'.")
 
 ;;; Labels
 
-(defun agent-shell-chat--label (text face)
-  "Return TEXT padded and propertized with FACE, as a chat label.
+(defun agent-shell-chat--label (text role)
+  "Return the chat label for TEXT, as `agent-shell-chat-label-function' draws it.
 
-FACE carries the box (see `agent-shell-chat-me-label').
+ROLE is `user' or `agent'.
 
-For example, (agent-shell-chat--label \"Me\" \\='agent-shell-chat-me-label)
-returns \" Me \" in that face."
-  (propertize (format " %s " text) 'face face))
+For example, (agent-shell-chat--label \"Me\" \\='user) returns \" Me \" in
+`agent-shell-chat-me-label' by default."
+  (funcall agent-shell-chat-label-function
+           (list (cons :text text)
+                 (cons :role role))))
+
+(defun agent-shell-chat--boxed-label (label)
+  "Return LABEL's text padded and propertized as a boxed badge.
+
+The default `agent-shell-chat-label-function'.  The face is picked by
+LABEL's :role (see `agent-shell-chat-me-label' and
+`agent-shell-chat-agent-label'), and carries the box.
+
+For example, over \\='((:text . \"Me\") (:role . user)) returns \" Me \"
+in `agent-shell-chat-me-label'."
+  (propertize (format " %s " (map-elt label :text))
+              'face (if (eq (map-elt label :role) 'user)
+                        'agent-shell-chat-me-label
+                      'agent-shell-chat-agent-label)))
+
+(defun agent-shell-chat--row-props (row)
+  "Return overlay properties drawing label ROW on the position it covers.
+
+A row is normally the overlay's `display'.  Emacs ignores `display'
+properties nested inside a `display' string, though, so a row holding
+one (e.g. a label drawn as an image by `agent-shell-chat-label-function')
+is drawn as a `before-string' instead, with `display' left to its line
+terminator.
+
+For example, over \" Me \\n\" in plain text returns
+\((display . \" Me \\n\") (before-string . \"\"))."
+  (if (text-property-not-all 0 (length row) 'display nil row)
+      (let ((terminated (string-suffix-p "\n" row)))
+        (list (cons 'display (if terminated "\n" ""))
+              (cons 'before-string (if terminated
+                                       (substring row 0 -1)
+                                     row))))
+    (list (cons 'display row)
+          (cons 'before-string ""))))
 
 (defun agent-shell-chat--busy-frame ()
   "Return the busy frame for the heartbeat's current beat, or nil when idle.
@@ -696,8 +750,7 @@ above, putting the first line of a multi-line input out of reach of
                       (save-excursion (goto-char run-end)
                                       (skip-chars-forward " \t\n")
                                       (point))))
-               (me-label (agent-shell-chat--label
-                          "Me" 'agent-shell-chat-me-label))
+               (me-label (agent-shell-chat--label "Me" 'user))
                ;; Face the padding and marker `default' so they do not inherit
                ;; the covered text's face: a display string's unfaced chars
                ;; take the face of the text they replace, and after a code
@@ -806,17 +859,17 @@ above, putting the first line of a multi-line input out of reach of
                     (agent-shell-chat--ensure-overlay
                      :tag 'me-label
                      :beg (+ pos offset) :end (+ pos offset 1)
-                     ;; Above the overlay covering the prompt, whose
-                     ;; `line-prefix' would otherwise indent the label with
-                     ;; the input it belongs beside.
-                     :props (list (cons 'display row)
-                                  ;; Spelled out so that a reused overlay
-                                  ;; cannot keep a label drawn the other way
-                                  ;; (see `agent-shell-chat--ensure-overlay').
-                                  (cons 'before-string "")
-                                  (cons 'priority 100)
-                                  (cons 'line-prefix "")
-                                  (cons 'wrap-prefix "")))
+                     ;; Both `display' and `before-string' are spelled out
+                     ;; so that a reused overlay cannot keep a label drawn
+                     ;; the other way (see `agent-shell-chat--ensure-overlay').
+                     :props (append
+                             (agent-shell-chat--row-props row)
+                             ;; Above the overlay covering the prompt, whose
+                             ;; `line-prefix' would otherwise indent the label
+                             ;; with the input it belongs beside.
+                             (list (cons 'priority 100)
+                                   (cons 'line-prefix "")
+                                   (cons 'wrap-prefix ""))))
                     kept))
                  label-rows)
               (push
@@ -950,8 +1003,7 @@ newline would merge the input line into the response for line motion
   (save-excursion
     (goto-char (point-min))
     (let ((label (agent-shell-chat--label
-                  (agent-shell-chat--agent-name)
-                  'agent-shell-chat-agent-label))
+                  (agent-shell-chat--agent-name) 'agent))
           (kept nil))
       (while (agent-shell-chat--search-marker-forward)
         (let* ((mbeg (match-beginning 0))
@@ -1033,11 +1085,10 @@ newline would merge the input line into the response for line motion
                      ;; either draws with.
                      :tag 'agent
                      :beg (+ start offset) :end (+ start offset 1)
-                     :props (list (cons 'display row)
-                                  ;; Clears the label the version before
-                                  ;; carried whole on this overlay.
-                                  (cons 'before-string "")
-                                  (cons 'priority 100)))
+                     ;; `before-string' is spelled out to clear the label
+                     ;; the version before carried whole on this overlay.
+                     :props (append (agent-shell-chat--row-props row)
+                                    (list (cons 'priority 100))))
                     kept))
                  rows))
               (push
@@ -1119,14 +1170,14 @@ replaced by the label, a blank line, and the marker the input follows:
 
    Me
 
-    \N{U+276F} "
+    \N{U+276F}"
   (let ((overlay (make-overlay beg end)))
     (overlay-put overlay 'agent-shell-chat--tag 'me)
     (overlay-put overlay 'display "")
     ;; Laid out as the shell lays out its own live prompt, without its
     ;; leading pad: nothing sits above this one to separate it from.
     (overlay-put overlay 'before-string
-                 (concat (agent-shell-chat--label "Me" 'agent-shell-chat-me-label)
+                 (concat (agent-shell-chat--label "Me" 'user)
                          (propertize "\n\n" 'face 'default)
                          (propertize (concat agent-shell-chat--body-indent
                                              agent-shell-chat--prompt)

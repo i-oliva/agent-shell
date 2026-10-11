@@ -4,10 +4,10 @@
 
 ;; Author: Alvaro Ramirez https://xenodium.com
 ;; URL: https://github.com/xenodium/agent-shell
-;; Version: 0.86.2
-;; Package-Requires: ((emacs "29.1") (shell-maker "0.97.5") (acp "0.15.1"))
+;; Version: 0.87.4
+;; Package-Requires: ((emacs "29.1") (shell-maker "0.97.5") (acp "0.17.1"))
 
-(defconst agent-shell--version "0.86.2")
+(defconst agent-shell--version "0.87.4")
 
 ;; Minimum dependency versions, as declared in the `Package-Requires'
 ;; header above.  Package managers that resolve versions enforce the
@@ -16,7 +16,7 @@
 ;; in sync with it.
 (defconst agent-shell--shell-maker-minimum-version "0.97.5")
 
-(defconst agent-shell--acp-minimum-version "0.15.1")
+(defconst agent-shell--acp-minimum-version "0.17.1")
 
 ;; This package is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -66,6 +66,7 @@
 (require 'agent-shell-mermaid)
 (require 'agent-shell-anthropic)
 (require 'agent-shell-auggie)
+(require 'agent-shell-block-motion)
 (require 'agent-shell-chat-mode)
 (require 'agent-shell-codebuddy)
 (require 'agent-shell-cline)
@@ -90,6 +91,7 @@
 (require 'agent-shell-mistral)
 (require 'agent-shell-omp)
 (require 'agent-shell-openai)
+(require 'agent-shell-openclaw)
 (require 'agent-shell-opencode)
 (require 'agent-shell-pi)
 (require 'agent-shell-project)
@@ -828,6 +830,7 @@ example filtering them.  See `agent-shell-agent-configs'."
         #'agent-shell-kiro-make-config
         #'agent-shell-mistral-make-config
         #'agent-shell-omp-make-agent-config
+        #'agent-shell-openclaw-make-agent-config
         #'agent-shell-opencode-make-agent-config
         #'agent-shell-pi-make-agent-config
         #'agent-shell-qoder-make-agent-config
@@ -916,6 +919,7 @@ behavior explicitly."
                  (const :tag "Kimi" kimi)
                  (const :tag "Kiro" kiro)
                  (const :tag "Mistral" le-chat)
+                 (const :tag "OpenClaw" openclaw)
                  (const :tag "OpenCode" opencode)
                  (const :tag "Pi" pi)
                  (const :tag "Qoder" qoder)
@@ -5056,6 +5060,39 @@ FUNCTION should be a function accepting keyword arguments (&key ...)."
                    (list (car pair) (cdr pair)))
                  alist)))
 
+(defun agent-shell-welcome-message (_config)
+  "Return welcome text shared by all agents.
+
+Shows how to get help, the latest news and how to support the
+project.  Agents' `:welcome-function' typically place it below their
+own banner, passing along their shell-maker config."
+  (concat
+   "       WELCOME\n\n"
+   "       Type " (propertize "help" 'font-lock-face 'italic) " and press "
+   (mapconcat (lambda (keys)
+                (propertize (key-description keys)
+                            'font-lock-face 'font-lock-string-face))
+              (where-is-internal #'agent-shell-submit agent-shell-mode-map)
+              " or ")
+   " for details.\n\n"
+   "       NEWS\n\n"
+   ;; Align bullets with the welcome text.
+   (let ((agent-shell-markdown-list-line-prefix (make-string 7 ?\s)))
+     (agent-shell-markdown-convert
+      "- `2026-09-22` [agent-shell 0.78 updates](https://xenodium.com/agent-shell-0-78-updates)
+- `2026-08-15` [agent-shell 0.73 updates](https://xenodium.com/agent-shell-0-73-updates)
+- `2026-07-22` [agent-shell 0.63 updates](https://xenodium.com/agent-shell-0-63-updates)"))
+   "\n\n"
+   "       FUNDING\n\n"
+   "       Is agent-shell fundamental to your workflow?\n"
+   "       It can only survive if its users help fund it.\n\n"
+   "       Consider ✨"
+   (shell-maker-make-button-text "sponsoring"
+                                 (lambda ()
+                                   (browse-url "https://github.com/sponsors/xenodium")
+                                   (message "Thank you!")))
+   "✨ (or ask your employer to).\n\n"))
+
 (cl-defun agent-shell--start (&key config no-focus new-session session-strategy session-id fork-session-id outgoing-request-decorator)
   "Programmatically start shell with CONFIG.
 
@@ -5150,6 +5187,8 @@ variable (see makunbound)"))
       ;; Initialize buffer-local shell-maker-config
       (setq-local agent-shell--shell-maker-config shell-maker-config)
       (setq-local filter-buffer-substring-function #'agent-shell--filter-buffer-substring)
+      (setq-local beginning-of-defun-function #'agent-shell--beginning-of-block)
+      (setq-local end-of-defun-function #'agent-shell--end-of-block)
       (agent-shell--update-header-and-mode-line)
       (add-hook 'kill-buffer-hook #'agent-shell--clean-up nil t)
       (add-hook 'kill-buffer-query-functions
@@ -6641,6 +6680,22 @@ Return file path of the generated SVG."
       (error "No traffic logs available.  Try M-x agent-shell-toggle-logging?"))
     (pop-to-buffer traffic-buffer)))
 
+(defun agent-shell-save-traffic ()
+  "Save agent shell traffic to a .traffic file and reveal it in `dired'."
+  (declare (modes agent-shell-mode))
+  (interactive)
+  (unless (derived-mode-p 'agent-shell-mode)
+    (error "Not in a shell"))
+  (when-let* ((shell-directory default-directory)
+              (traffic-file
+               (with-current-buffer (acp-traffic-buffer :client (map-elt (agent-shell--state) :client))
+                 (when (= (buffer-size) 0)
+                   (error "No traffic logs available.  Try M-x agent-shell-toggle-logging?"))
+                 (let ((default-directory shell-directory))
+                   (call-interactively #'acp-traffic-save-to))))
+              ((file-exists-p traffic-file)))
+    (dired-jump t traffic-file)))
+
 (defun agent-shell-view-acp-logs ()
   "View agent shell ACP logs buffer."
   (declare (modes agent-shell-mode))
@@ -6684,9 +6739,20 @@ Return file path of the generated SVG."
     (format "#%02x%02x%02x" r g b)))
 
 (cl-defun agent-shell--make-missing-executable-error (&key executable install-instructions)
-  "Create error message for missing EXECUTABLE.
-INSTALL-INSTRUCTIONS is optional installation guidance."
-  (concat (format "Executable \"%s\" not found.  Do you need (add-to-list 'exec-path \"another/path/to/consider/\")?" executable)
+  "Return error message for missing EXECUTABLE.
+
+INSTALL-INSTRUCTIONS is optional installation guidance.
+
+When `default-directory' is remote, suggest `tramp-remote-path'
+instead of `exec-path'.  For example, with `default-directory'
+set to \"/ssh:host:/project/\" and EXECUTABLE \"agent\":
+
+  Executable \"agent\" not found on host.  Do you need
+  (add-to-list \\='tramp-remote-path \"/remote/path/to/consider/\")
+  followed by M-x tramp-cleanup-connection?"
+  (concat (if-let* ((host (file-remote-p default-directory 'host)))
+              (format "Executable \"%s\" not found on %s.  Do you need (add-to-list 'tramp-remote-path \"/remote/path/to/consider/\") followed by M-x tramp-cleanup-connection?" executable host)
+            (format "Executable \"%s\" not found.  Do you need (add-to-list 'exec-path \"another/path/to/consider/\")?" executable))
           (when install-instructions
             (concat "  " install-instructions))))
 
@@ -9369,6 +9435,11 @@ If the shell is busy with no live prompt, it is queued instead."
                             (use-local-map map))
                           (current-buffer)))
          (window-config (current-window-configuration))
+         ;; Run the command in the shell buffer's directory, not the
+         ;; calling buffer's (they differ when invoked from a viewport),
+         ;; and through its file handler, so remote (TRAMP) shells
+         ;; execute there instead of silently running locally.
+         (default-directory (buffer-local-value 'default-directory shell-buffer))
          (proc (make-process
                 :name command
                 :buffer output-buffer
@@ -9380,6 +9451,7 @@ If the shell is busy with no live prompt, it is queued instead."
                                   ;; (all into output buffer)
                                   (format "%s 2>&1" command))))
                 :connection-type 'pipe
+                :file-handler t
                 :filter
                 (lambda (proc output)
                   (when (buffer-live-p (process-buffer proc))
