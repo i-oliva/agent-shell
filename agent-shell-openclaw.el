@@ -29,7 +29,6 @@
   (require 'cl-lib))
 (require 'shell-maker)
 (require 'acp)
-(require 'agent-shell-history)
 (defvar agent-shell-context-sources)
 
 (declare-function agent-shell--indent-string "agent-shell")
@@ -147,8 +146,9 @@ ORIGINAL receives the request keyword ARGS."
                            (funcall handler err raw))))))
     (apply original args)))
 
-(unless (advice-member-p #'agent-shell-openclaw--load-error-a 'agent-shell--send-request)
-  (advice-add 'agent-shell--send-request :around #'agent-shell-openclaw--load-error-a))
+(with-eval-after-load 'agent-shell
+  (unless (advice-member-p #'agent-shell-openclaw--load-error-a 'agent-shell--send-request)
+    (advice-add 'agent-shell--send-request :around #'agent-shell-openclaw--load-error-a)))
 
 (provide 'agent-shell-openclaw)
 
