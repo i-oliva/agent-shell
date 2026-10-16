@@ -17,9 +17,9 @@ Thank you!
 
 * agent-shell
 
-A native Emacs shell to interact with LLM agents powered by ACP ([[https://agentclientprotocol.com][Agent Client Protocol]]).
+=agent-shell= brings your favorite AI agents to [[https://www.gnu.org/software/emacs/][Emacs]], keeping you at home: familiar buffers and bindings, no terminal emulation. All powered by ACP, the [[https://agentclientprotocol.com][Agent Client Protocol]].
 
-With agent-shell, you can interact with any ACP-driven agent like:
+Works with 23 agents today, and any other that speaks ACP:
 
 - [[https://code.claude.com/docs/en/overview][Claude Agent]] (Anthropic)
 - [[https://github.com/agentclientprotocol/codex-acp][Codex]] (OpenAI)
@@ -27,6 +27,8 @@ With agent-shell, you can interact with any ACP-driven agent like:
 - [[https://goose-docs.ai/docs/getting-started/installation][Goose]]
 - [[https://docs.x.ai/docs/overview][Grok Build]] (xAI)
 - [[https://cursor.com/docs/cli][Cursor]]
+- [[https://docs.cline.bot/usage/acp][Cline]]
+- [[https://docs.github.com/en/copilot/reference/copilot-cli-reference/acp-server][GitHub Copilot]]
 - [[https://www.kimi.com/code][Kimi Code CLI]]
 - [[https://www.codebuddy.ai][CodeBuddy]]
 - [[https://kiro.dev][Kiro CLI]]
@@ -37,6 +39,7 @@ With agent-shell, you can interact with any ACP-driven agent like:
 - [[https://factory.ai][Factory Droid]]
 - [[https://github.com/svkozak/pi-acp][Pi]]
 - [[https://github.com/can1357/oh-my-pi][Oh My Pi]]
+- [[https://github.com/NousResearch/hermes-agent][Hermes]]
 - [[https://opencode.ai][OpenCode]]
 - [[https://openclaw.ai][OpenClaw]]
 - [[https://antigravity.google/docs/ide/extensions][Antigravity]] (Google)
@@ -1131,6 +1134,7 @@ always go to Evil modes if you need to with ~C-z~).
 | agent-shell-clipboard-image-handlers          | Handlers for saving clipboard images to a file.                                 |
 | agent-shell-codebuddy-acp-command             | Command and parameters for the CodeBuddy agent client.                          |
 | agent-shell-codebuddy-environment             | Environment variables for the CodeBuddy agent client.                           |
+| agent-shell-command-completion-enabled        | Non-nil pops agent command completion as / is typed.                            |
 | agent-shell-command-prefix                    | Prefix to apply when executing agent commands and shell commands.               |
 | agent-shell-completion-mode-hook              | Hook run after entering or leaving ‘agent-shell-completion-mode’.               |
 | agent-shell-confirm-interrupt                 | Whether to prompt for confirmation before interrupting.                         |
@@ -1149,7 +1153,7 @@ always go to Evil modes if you need to with ~C-z~).
 | agent-shell-droid-default-session-mode-id     | Default Droid AI session mode ID.                                               |
 | agent-shell-droid-environment                 | Environment variables for the Factory Droid ACP client.                         |
 | agent-shell-embed-file-size-limit             | Maximum file size in bytes for embedding with ContentBlock::Resource.           |
-| agent-shell-file-completion-enabled           | Non-nil enables ‘agent-shell-completion-mode’ when starting shells.             |
+| agent-shell-file-completion-enabled           | Non-nil pops project file completion as @ is typed.                             |
 | agent-shell-file-display-action               | Display action for files opened from a link, image, or ‘@file’ mention.         |
 | agent-shell-github-acp-command                | Command and parameters for the GitHub Copilot agent client.                     |
 | agent-shell-github-default-model-id           | Default GitHub Copilot model ID.                                                |

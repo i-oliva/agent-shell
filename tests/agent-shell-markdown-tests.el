@@ -4874,6 +4874,63 @@ Searches with `case-fold-search' nil, as
     (should (equal (cons 1 6) (agent-shell-markdown--search-file-reference)))
     (should (null (agent-shell-markdown--search-file-reference)))))
 
+(ert-deftest agent-shell-markdown-tracking-label-shown-until-opened ()
+  (let* ((directory (make-temp-file "agent-shell-tracking" t))
+         (tracking-file (expand-file-name "nested/links.eld" directory))
+         (markdown "[docs](https://example.com/docs){tracking-label=\"(new)\"} and [other](https://example.com/other)"))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-markdown--open-link) #'ignore))
+          (with-temp-buffer
+            (insert (agent-shell-markdown-convert markdown :tracking-file tracking-file))
+            ;; The label is drawn over the title's last character, never inserted.
+            (should (equal (buffer-string) "docs and other"))
+            (let ((display (get-text-property (length "docs") 'display)))
+              (should (equal (cddr display) "s (new)"))
+              ;; The label does not inherit the link's underline.
+              (should (equal (get-text-property 1 'face (cddr display))
+                             '((:underline nil) agent-shell-markdown-inline-code)))
+              (should (eval (cadr display) t))
+              (funcall (lookup-key (get-text-property (point-min) 'keymap) (kbd "RET")))
+              (should (equal (buffer-string) "docs and other"))
+              (should-not (eval (cadr display) t)))
+            ;; Opening again records nothing new.
+            (funcall (lookup-key (get-text-property (point-min) 'keymap) (kbd "RET"))))
+          (let ((links (agent-shell-markdown--read-tracked-links tracking-file)))
+            (should (equal (length links) 1))
+            (should (equal (map-elt (seq-first links) :url) "https://example.com/docs"))
+            (should (string-match-p "\\`[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}T"
+                                    (map-elt (seq-first links) :opened))))
+          ;; Once opened, a fresh render carries no label at all.
+          (should-not (get-text-property
+                       (length "doc") 'display
+                       (agent-shell-markdown-convert markdown :tracking-file tracking-file))))
+      (delete-directory directory t))))
+
+(ert-deftest agent-shell-markdown-tracking-label-left-literal-without-tracking-file ()
+  (should (equal (substring-no-properties
+                  (agent-shell-markdown-convert
+                   "[docs](https://example.com/docs){tracking-label=\"(new)\"}"))
+                 "docs{tracking-label=\"(new)\"}")))
+
+(ert-deftest agent-shell-markdown-untracked-link-not-recorded ()
+  (let ((tracking-file (make-temp-file "agent-shell-tracking" nil ".eld")))
+    (delete-file tracking-file)
+    (cl-letf (((symbol-function 'agent-shell-markdown--open-link) #'ignore))
+      (with-temp-buffer
+        (insert (agent-shell-markdown-convert "[docs](https://example.com/docs)"
+                                              :tracking-file tracking-file))
+        (funcall (lookup-key (get-text-property (point-min) 'keymap) (kbd "RET")))))
+    (should-not (file-exists-p tracking-file))))
+
+(ert-deftest agent-shell-markdown-parse-link-attributes ()
+  (should (equal (agent-shell-markdown--parse-link-attributes
+                  "tracking-label=\"(new) post\"")
+                 '((:tracking-label . "(new) post"))))
+  (should (equal (agent-shell-markdown--parse-link-attributes
+                  ".class tracking-label=new")
+                 '((:tracking-label . "new"))))
+  (should-not (agent-shell-markdown--parse-link-attributes "width=50%")))
+
 (provide 'agent-shell-markdown-tests)
 
 ;;; agent-shell-markdown-tests.el ends here

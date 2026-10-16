@@ -191,6 +191,41 @@ the queue does not have to know completion exists."
     (should (memq #'agent-shell--command-completion-at-point
                   completion-at-point-functions))))
 
+(ert-deftest agent-shell-completion-trigger-per-action-test ()
+  "@ and / each pop only when their own option allows it.
+Large projects can make @ slow while / stays cheap, so one is often
+wanted without the other."
+  (let ((shell (agent-shell-completion-tests--make-shell)))
+    (unwind-protect
+        (dolist (case '(((:file . nil) (:command . t)   (:popped . (?/)))
+                        ((:file . t)   (:command . nil) (:popped . (?@)))))
+          (let ((agent-shell-file-completion-enabled (map-elt case :file))
+                (agent-shell-command-completion-enabled (map-elt case :command))
+                (popped nil))
+            (cl-letf (((symbol-function 'completion-at-point)
+                       (lambda () (push (char-before) popped))))
+              (dolist (input '("/" "@"))
+                (with-temp-buffer
+                  (setq-local agent-shell-completion--shell-buffer shell)
+                  (insert input)
+                  (agent-shell--trigger-completion-at-point))))
+            (should (equal popped (map-elt case :popped)))))
+      (kill-buffer shell))))
+
+(ert-deftest agent-shell-completion-setup-mode-test ()
+  "Setup enables the mode unless both popping options are off."
+  (dolist (case '(((:file . t)   (:command . t)   (:mode . t))
+                  ((:file . nil) (:command . t)   (:mode . t))
+                  ((:file . t)   (:command . nil) (:mode . t))
+                  ((:file . nil) (:command . nil) (:mode . nil))))
+    (with-temp-buffer
+      (let ((agent-shell-file-completion-enabled (map-elt case :file))
+            (agent-shell-command-completion-enabled (map-elt case :command)))
+        (agent-shell-completion--setup)
+        (should (eq (and agent-shell-completion-mode t) (map-elt case :mode)))
+        (should (memq #'agent-shell--file-completion-at-point
+                      completion-at-point-functions))))))
+
 (ert-deftest agent-shell--capf-exit-unfinished-test ()
   "Statuses other than `finished' leave the buffer alone.
 UIs like Corfu and Company report `sole' or `exact' while the user may

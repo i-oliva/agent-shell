@@ -736,7 +736,8 @@ Drives an ACP `session/update' notification through
 `agent-shell--on-notification' and asserts the body handed to the renderer
 is what `agent-shell--content-block-to-markdown' produces for the content
 block -- covering the dispatch path, not just the helper in isolation."
-  (let ((state (list (cons :chunked-group-count 0)
+  (let ((agent-shell--stream-render-interval nil)
+        (state (list (cons :chunked-group-count 0)
                      ;; Pre-set so the header/end-of-prompt branches are
                      ;; skipped; the test only exercises content rendering.
                      (cons :last-entry-type "agent_message_chunk")
@@ -773,6 +774,136 @@ block -- covering the dispatch path, not just the helper in isolation."
                                       (mimeType . "image/png")
                                       (uri . "file:///tmp/x.png"))))))
       (should (equal rendered "\n\n![image](file:///tmp/x.png)\n\n")))))
+
+(ert-deftest agent-shell--stream-render-coalesces-chunks-test ()
+  "Render consecutive chunks once, without postponing the batch timer."
+  (with-temp-buffer
+    (let ((agent-shell--stream-render-interval 30)
+          (state (agent-shell--make-state :buffer (current-buffer)))
+          (rendered nil))
+      (cl-letf (((symbol-function 'agent-shell--update-fragment)
+                 (lambda (&rest args) (push args rendered))))
+        (agent-shell--update-streamed-fragment
+         :state state :block-id "a" :body "hello " :create-new t)
+        (let ((timer (map-elt state :stream-render-timer)))
+          (agent-shell--update-streamed-fragment
+           :state state :block-id "a" :body "world")
+          (should (eq timer (map-elt state :stream-render-timer))))
+        (should-not rendered)
+        (agent-shell--flush-stream-render state)
+        (should (= (length rendered) 1))
+        (should (equal (plist-get (car rendered) :body) "hello world"))
+        (should (plist-get (car rendered) :create-new))
+        (should (plist-get (car rendered) :append))
+        (should-not (map-elt state :stream-render-timer))))))
+
+(ert-deftest agent-shell--stream-render-flushes-on-fragment-change-test ()
+  "Flush the previous batch when the fragment changes."
+  (with-temp-buffer
+    (let ((agent-shell--stream-render-interval 30)
+          (state (agent-shell--make-state :buffer (current-buffer)))
+          (rendered nil))
+      (cl-letf (((symbol-function 'agent-shell--update-fragment)
+                 (lambda (&rest args) (push (plist-get args :body) rendered))))
+        (agent-shell--update-streamed-fragment :state state :block-id "a" :body "one")
+        (agent-shell--update-streamed-fragment :state state :block-id "b" :body "two")
+        (should (equal rendered '("one")))
+        (agent-shell--flush-stream-render state)
+        (should (equal (nreverse rendered) '("one" "two")))))))
+
+(ert-deftest agent-shell--stream-render-flushes-on-create-new-test ()
+  "A new message must not coalesce into the previous one."
+  (with-temp-buffer
+    (let ((agent-shell--stream-render-interval 30)
+          (state (agent-shell--make-state :buffer (current-buffer)))
+          (rendered nil))
+      (cl-letf (((symbol-function 'agent-shell--update-fragment)
+                 (lambda (&rest args) (push (plist-get args :body) rendered))))
+        (agent-shell--update-streamed-fragment :state state :block-id "a" :body "old")
+        (agent-shell--update-streamed-fragment
+         :state state :block-id "a" :body "new" :create-new t)
+        (should (equal rendered '("old")))
+        (agent-shell--flush-stream-render state)
+        (should (equal (nreverse rendered) '("old" "new")))))))
+
+(ert-deftest agent-shell--stream-render-timer-flushes-batch-test ()
+  "Render a pending batch without waiting for another chunk."
+  (with-temp-buffer
+    (let ((agent-shell--stream-render-interval 0.01)
+          (state (agent-shell--make-state :buffer (current-buffer)))
+          (rendered nil))
+      (cl-letf (((symbol-function 'agent-shell--update-fragment)
+                 (lambda (&rest args) (push (plist-get args :body) rendered))))
+        (agent-shell--update-streamed-fragment :state state :block-id "a" :body "tail")
+        (should-not rendered)
+        (with-timeout (2 (ert-fail "Timer never flushed the batch"))
+          (while (not rendered)
+            (accept-process-output nil 0.005)))
+        (should (equal rendered '("tail")))
+        (should-not (map-elt state :stream-render-timer))
+        (should-not (map-elt state :stream-render-pending))))))
+
+(ert-deftest agent-shell--stream-render-flush-without-pending-is-noop-test ()
+  "Flushing with nothing pending renders nothing."
+  (with-temp-buffer
+    (let ((state (agent-shell--make-state :buffer (current-buffer)))
+          (rendered nil))
+      (cl-letf (((symbol-function 'agent-shell--update-fragment)
+                 (lambda (&rest args) (push args rendered))))
+        (agent-shell--flush-stream-render state)
+        (should-not rendered)))))
+
+(ert-deftest agent-shell--stream-render-disabled-test ()
+  "A nil interval renders every chunk immediately."
+  (with-temp-buffer
+    (let ((agent-shell--stream-render-interval nil)
+          (state (agent-shell--make-state :buffer (current-buffer)))
+          (rendered nil))
+      (cl-letf (((symbol-function 'agent-shell--update-fragment)
+                 (lambda (&rest args) (push (plist-get args :body) rendered))))
+        (agent-shell--update-streamed-fragment :state state :block-id "a" :body "one")
+        (agent-shell--update-streamed-fragment :state state :block-id "a" :body "two")
+        (should (equal (nreverse rendered) '("one" "two")))
+        (should-not (map-elt state :stream-render-timer))
+        (should-not (map-elt state :stream-render-pending))))))
+
+(ert-deftest agent-shell--stream-render-restore-preserves-turn-order-test ()
+  "Restored answers must precede the next user prompt."
+  (with-temp-buffer
+    (comint-mode)
+    (let ((agent-shell--stream-render-interval 30)
+          (agent-shell-persistent-prompt-enabled nil)
+          (state (agent-shell--make-state
+                  :buffer (current-buffer)
+                  :agent-config '((:shell-prompt . "Agent> "))))
+          (rendered nil))
+      (map-put! state :pending-restore (agent-shell--make-pending-restore))
+      (dolist (entry '(("user_message_chunk" . "first prompt")
+                       ("agent_message_chunk" . "first answer")
+                       ("user_message_chunk" . "second prompt")
+                       ("agent_message_chunk" . "second answer")))
+        (agent-shell--append-restore-notification
+         state (agent-shell-tests--make-session-update (car entry) (cdr entry))))
+      ;; Keep dispatch and both update paths real; record only the UI writes.
+      (cl-letf (((symbol-function 'agent-shell--create-bootstrapping-placeholders) #'ignore)
+                ((symbol-function 'agent-shell--append-transcript) #'ignore)
+                ((symbol-function 'agent-shell--emit-event) #'ignore)
+                ((symbol-function 'agent-shell--render-deferred-markup) #'ignore)
+                ((symbol-function 'agent-shell--reset-undo-history) #'ignore)
+                ((symbol-function 'shell-maker-insert-end-of-prompt-marker) #'ignore)
+                ((symbol-function 'agent-shell--effective-restore-verbosity) (lambda (_) 'full))
+                ((symbol-function 'agent-shell-viewport--buffer) (lambda (&rest _) nil))
+                ((symbol-function 'derived-mode-p) (lambda (&rest _) t))
+                ((symbol-function 'agent-shell-ui-update-text)
+                 (lambda (&rest args) (push (plist-get args :text) rendered)))
+                ((symbol-function 'agent-shell-ui-update-fragment)
+                 (lambda (model &rest _) (push (map-elt model :body) rendered) nil)))
+        (agent-shell--render-pending-restore state)
+        (should (equal (nreverse rendered)
+                       '("Agent> first prompt" "first answer"
+                         "Agent> second prompt" "second answer")))
+        (should-not (map-elt state :stream-render-pending))
+        (should-not (map-elt state :stream-render-timer))))))
 
 (ert-deftest agent-shell--on-notification-session-info-update-test ()
   "Test `session_info_update' updates the session title.
@@ -6409,7 +6540,8 @@ CHUNKS is a list of (MESSAGE-ID . TEXT) pairs (MESSAGE-ID may be nil).
 Between successive chunks `:last-entry-type' is left as-is, reproducing an
 interleaved entry that failed to advance it.  Returns a list of
 \(BLOCK-ID . CREATE-NEW) as passed to `agent-shell--update-fragment'."
-  (let ((state (list (cons :last-entry-type nil)
+  (let ((agent-shell--stream-render-interval nil)
+        (state (list (cons :last-entry-type nil)
                      (cons :last-agent-message-id nil)
                      (cons :chunked-group-count 0)
                      (cons :active-requests t)
@@ -6566,6 +6698,7 @@ in flight shows its members."
   (let ((collapsed '())
         (expanded '())
         (agent-shell-activity-group-expand-by-default 'latest)
+        (agent-shell--stream-render-interval nil)
         (state (list (cons :tool-calls nil)
                      (cons :last-entry-type nil)
                      (cons :last-agent-message-id nil)
@@ -9042,6 +9175,167 @@ Its retired default is left alone, as is an unbound variable."
     (let ((agent-shell-chat-busy-frames ["|" "/" "-" "\\"]))
       (should (catch 'started (agent-shell--start :config nil))))
     (should (catch 'started (agent-shell--start :config nil)))))
+
+(defun agent-shell-tests--make-started-shell (name directory)
+  "Return a buffer NAME standing in for a shell started in DIRECTORY.
+
+Its state records it as its own `:buffer', as `agent-shell--start'
+leaves it."
+  (let ((buffer (generate-new-buffer name)))
+    (with-current-buffer buffer
+      (setq default-directory directory)
+      (setq-local agent-shell--state
+                  (agent-shell--make-state :buffer buffer)))
+    buffer))
+
+(ert-deftest agent-shell-cwd-in-started-shell-test ()
+  "Test that a started shell reports its own directory as `agent-shell-cwd'.
+
+Only a shell `agent-shell--start' has finished setting up skips
+`agent-shell-cwd-function'."
+  (let* ((cwd-calls 0)
+         (agent-shell-cwd-function (lambda ()
+                                     (setq cwd-calls (1+ cwd-calls))
+                                     "/path/to/elsewhere/"))
+         (shell (agent-shell-tests--make-started-shell
+                 "started-shell" "/path/to/project/")))
+    (unwind-protect
+        (progn
+          (with-current-buffer shell
+            (should (equal (agent-shell-cwd) "/path/to/project/")))
+          (should (equal cwd-calls 0))
+          ;; A buffer that isn't a shell, like the file buffer
+          ;; `agent-shell' was invoked from, asks `agent-shell-cwd-function'.
+          (with-temp-buffer
+            (should (equal (agent-shell-cwd) "/path/to/elsewhere/")))
+          (should (equal cwd-calls 1)))
+      (kill-buffer shell))))
+
+(ert-deftest agent-shell-project-buffers-uses-given-cwd-test ()
+  "Test that `agent-shell-project-buffers' matches buffers against CWD."
+  (let ((in-project (generate-new-buffer "in-project-shell"))
+        (other-project (generate-new-buffer "other-project-shell")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-buffers)
+                   (lambda () (list in-project other-project)))
+                  ((symbol-function 'agent-shell-cwd)
+                   (lambda ()
+                     (if (eq (current-buffer) in-project)
+                         "/path/to/project/"
+                       "/path/to/elsewhere/"))))
+          ;; Given a CWD argument, buffers are matched against it rather than
+          ;; against the current buffer's own CWD.
+          (should (equal (agent-shell-project-buffers "/path/to/project/")
+                         (list in-project)))
+          (should (equal (agent-shell-project-buffers "/path/to/nowhere/")
+                         nil))
+          ;; Without a CWD argument, it is computed in the current buffer.
+          (with-current-buffer in-project
+            (should (equal (agent-shell-project-buffers)
+                           (list in-project)))))
+      (kill-buffer in-project)
+      (kill-buffer other-project))))
+
+(ert-deftest agent-shell--shell-buffer-returns-project-shell-test ()
+  "Test that finding an open project shell resolves the CWD only once.
+
+`agent-shell-cwd-function' may be expensive or interactive (prompting
+for a directory, say), so it runs for the current buffer alone, not
+again for every open shell `agent-shell-project-buffers' looks at."
+  (let* ((cwd-calls 0)
+         (agent-shell-cwd-function (lambda ()
+                                     (setq cwd-calls (1+ cwd-calls))
+                                     "/path/to/project/"))
+         (shells (list (agent-shell-tests--make-started-shell
+                        "other-shell" "/path/to/elsewhere/")
+                       (agent-shell-tests--make-started-shell
+                        "project-shell" "/path/to/project/")
+                       (agent-shell-tests--make-started-shell
+                        "another-shell" "/path/to/another/")))
+         (started nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-buffers)
+                   (lambda () shells))
+                  ((symbol-function 'agent-shell--start)
+                   (lambda (&rest _)
+                     (setq started t)
+                     (generate-new-buffer "fake-shell"))))
+          (with-temp-buffer
+            (should (eq (agent-shell--shell-buffer) (nth 1 shells)))
+            (should (equal cwd-calls 1))
+            (should-not started)))
+      (mapc #'kill-buffer shells))))
+
+(ert-deftest agent-shell--shell-buffer-computes-cwd-once-test ()
+  "Test that creating a shell resolves `agent-shell-cwd-function' only once.
+
+With no open shell in the project, `agent-shell--shell-buffer' hands the
+CWD it looked up shells by to `agent-shell--start' rather than have it
+recomputed there."
+  (let* ((cwd-calls 0)
+         (agent-shell-session-strategy 'prompt)
+         (agent-shell-cwd-function (lambda ()
+                                     (setq cwd-calls (1+ cwd-calls))
+                                     "/path/to/project/"))
+         (shells (list (agent-shell-tests--make-started-shell
+                        "other-shell" "/path/to/elsewhere/")
+                       (agent-shell-tests--make-started-shell
+                        "another-shell" "/path/to/another/")))
+         (start-args nil)
+         (fake-shell nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-buffers)
+                   (lambda () shells))
+                  ((symbol-function 'agent-shell--auto-preferred-config)
+                   (lambda () (agent-shell-make-agent-config :buffer-name "Fake")))
+                  ((symbol-function 'agent-shell--start)
+                   (lambda (&rest args)
+                     (setq start-args args)
+                     (setq fake-shell (generate-new-buffer "fake-shell")))))
+          (with-temp-buffer
+            (should (eq (agent-shell--shell-buffer) fake-shell))
+            (should (equal cwd-calls 1))
+            (should (equal (plist-get start-args :cwd) "/path/to/project/"))))
+      (mapc #'kill-buffer shells)
+      (when (buffer-live-p fake-shell)
+        (kill-buffer fake-shell)))))
+
+(ert-deftest agent-shell--start-cwd-test ()
+  "Test that `agent-shell--start' starts the shell in CWD when given.
+
+Only when CWD is nil does it fall back to computing `agent-shell-cwd'.
+A directory that does not exist is an error, rather than leaving
+`shell-maker-start-v2' to start the shell somewhere else."
+  (let* ((passed-dir (file-name-as-directory (make-temp-file "passed-" t)))
+         (computed-dir (file-name-as-directory (make-temp-file "computed-" t)))
+         (cwd-calls 0)
+         (agent-shell-cwd-function (lambda ()
+                                     (setq cwd-calls (1+ cwd-calls))
+                                     computed-dir))
+         (config (agent-shell-make-agent-config
+                  :buffer-name "Fake"
+                  :shell-prompt "Fake> "
+                  :shell-prompt-regexp "Fake> ")))
+    (unwind-protect
+        ;; Capture the `default-directory' the shell would start in,
+        ;; bailing out before any of the shell machinery runs.
+        (cl-letf (((symbol-function 'shell-maker-start-v2)
+                   (lambda (&rest _)
+                     (throw 'agent-shell-tests--started default-directory))))
+          (should (equal (catch 'agent-shell-tests--started
+                           (agent-shell--start :config config :cwd passed-dir))
+                         passed-dir))
+          (should (equal cwd-calls 0))
+          (should (equal (catch 'agent-shell-tests--started
+                           (agent-shell--start :config config))
+                         computed-dir))
+          (should (equal cwd-calls 1))
+          (delete-directory passed-dir)
+          (should-error (catch 'agent-shell-tests--started
+                          (agent-shell--start :config config :cwd passed-dir))))
+      (dolist (dir (list passed-dir computed-dir))
+        (when (file-directory-p dir)
+          (delete-directory dir))))))
 
 (provide 'agent-shell-tests)
 ;;; agent-shell-tests.el ends here

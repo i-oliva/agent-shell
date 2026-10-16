@@ -4,10 +4,10 @@
 
 ;; Author: Alvaro Ramirez https://xenodium.com
 ;; URL: https://github.com/xenodium/agent-shell
-;; Version: 0.87.4
+;; Version: 0.87.10
 ;; Package-Requires: ((emacs "29.1") (shell-maker "0.97.5") (acp "0.17.1"))
 
-(defconst agent-shell--version "0.87.4")
+(defconst agent-shell--version "0.87.10")
 
 ;; Minimum dependency versions, as declared in the `Package-Requires'
 ;; header above.  Package managers that resolve versions enforce the
@@ -314,6 +314,15 @@ are applied.  Each function is called with a range alist containing:
   "Whether or not to highlight source blocks."
   :type 'boolean
   :group 'agent-shell)
+
+(defvar agent-shell--stream-render-interval 0.05
+  "Seconds to coalesce streamed message chunks before rendering them.
+
+Batching avoids re-rendering a growing markdown body on every chunk.
+Other fragment or plain text updates flush pending chunks first,
+preserving their order.
+
+Nil renders every chunk.")
 
 (defcustom agent-shell-markdown-render-function
   #'agent-shell-markdown-replace-markup
@@ -1300,6 +1309,8 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
         (cons :prompt-capabilities nil)
         (cons :event-subscriptions nil)
         (cons :idle-timer nil)
+        (cons :stream-render-pending nil)
+        (cons :stream-render-timer nil)
         (cons :sleep-token nil)
         (cons :active-requests nil)
         (cons :pending-prompts nil)
@@ -3394,7 +3405,7 @@ Clears STATE's `:expanded-activity-group'."
              (agent-shell--emit-event
               :event 'agent-message-chunk
               :data (list (cons :text-chunk (map-nested-elt acp-notification '(params update content text)))))
-             (agent-shell--update-fragment
+             (agent-shell--update-streamed-fragment
               :state state
               ;; Out of turn, key under a dedicated namespace so the
               ;; message forms its own fragment rather than coalescing
@@ -3406,9 +3417,6 @@ Clears STATE's `:expanded-activity-group'."
                                 (or message-id (map-elt state :chunked-group-count)))
               :body content
               :create-new new-message
-              :append t
-              :navigation 'never
-              :render-body-images t
               ;; Out of turn (no prompt request in flight) lands the
               ;; message above the fresh prompt rather than after it.
               :above-last-prompt (not (agent-shell--active-requests-p state)))
@@ -4611,6 +4619,7 @@ side)."
 For example, shut down ACP client."
   (when (derived-mode-p 'agent-shell-mode)
     (agent-shell--cancel-idle-timer)
+    (agent-shell--cancel-stream-render-timer (agent-shell--state))
     (agent-shell--emit-event :event 'clean-up)
     (agent-shell--shutdown)
     ;; Kill any open diff buffers associated with tool calls.
@@ -5079,13 +5088,13 @@ own banner, passing along their shell-maker config."
    ;; Align bullets with the welcome text.
    (let ((agent-shell-markdown-list-line-prefix (make-string 7 ?\s)))
      (agent-shell-markdown-convert
-      "- `2026-09-22` [agent-shell 0.78 updates](https://xenodium.com/agent-shell-0-78-updates)
-- `2026-08-15` [agent-shell 0.73 updates](https://xenodium.com/agent-shell-0-73-updates)
-- `2026-07-22` [agent-shell 0.63 updates](https://xenodium.com/agent-shell-0-63-updates)"))
+      "- `2026-10-13` [agent-shell 0.87 updates](https://xenodium.com/agent-shell-0-87-updates){tracking-label=\"(new)\"}
+- `2026-09-22` [agent-shell 0.78 updates](https://xenodium.com/agent-shell-0-78-updates)
+- `2026-08-15` [agent-shell 0.73 updates](https://xenodium.com/agent-shell-0-73-updates)"
+      :tracking-file (locate-user-emacs-file "agent-shell/markdown-links.eld")))
    "\n\n"
    "       FUNDING\n\n"
-   "       Is agent-shell fundamental to your workflow?\n"
-   "       It can only survive if its users help fund it.\n\n"
+   "       Tokens keep your agents running. Sponsors keep agent-shell running.\n\n"
    "       Consider ✨"
    (shell-maker-make-button-text "sponsoring"
                                  (lambda ()
@@ -5093,10 +5102,15 @@ own banner, passing along their shell-maker config."
                                    (message "Thank you!")))
    "✨ (or ask your employer to).\n\n"))
 
-(cl-defun agent-shell--start (&key config no-focus new-session session-strategy session-id fork-session-id outgoing-request-decorator)
+(cl-defun agent-shell--start (&key config no-focus new-session session-strategy session-id fork-session-id outgoing-request-decorator cwd)
   "Programmatically start shell with CONFIG.
 
 See `agent-shell-make-agent-config' for config format.
+
+CWD is the shell's working directory, defaulting to `agent-shell-cwd'.
+Callers that have already computed it should pass it, since
+`agent-shell-cwd-function' may be expensive or interactive.  Signal an
+error if it is not an existing directory.
 
 Set NO-FOCUS to start in background.
 Set NEW-SESSION to start a separate new session.
@@ -5133,7 +5147,12 @@ variable (see makunbound)"))
                               :prompt (map-elt config :shell-prompt)
                               :prompt-regexp (map-elt config :shell-prompt-regexp)))
          (agent-shell--shell-maker-config shell-maker-config)
-         (default-directory (agent-shell-cwd))
+         (default-directory (let ((cwd (or cwd (agent-shell-cwd))))
+                              ;; `shell-maker-start-v2' would otherwise quietly
+                              ;; fall back to "~/" and use that value forever.
+                              (unless (file-directory-p cwd)
+                                (error "Not an existing directory: %s" cwd))
+                              cwd))
          (shell-buffer
           ;; Suppress mode hook during shell-maker-start since
           ;; agent-shell state isn't ready yet.
@@ -5201,8 +5220,6 @@ variable (see makunbound)"))
       (add-hook 'agent-shell-ui-post-expand-fragment-at-point-hook
                 #'agent-shell--render-markdown nil t)
       (agent-shell-completion--setup)
-      (when agent-shell-file-completion-enabled
-        (agent-shell-completion-mode +1))
       (agent-shell--enable-dnd)
       (yank-media-handler "image/.*" #'agent-shell--yank-media-image)
       (agent-shell--setup-modeline)
@@ -5429,6 +5446,80 @@ the reported range down to the newly inserted chars."
   (when-let* ((untagged (text-property-not-all start end 'field 'output)))
     (add-text-properties untagged end '(field output))))
 
+(defun agent-shell--arm-stream-render-timer (state)
+  "Schedule STATE's pending batch without postponing an existing timer."
+  (unless (map-elt state :stream-render-timer)
+    (map-put! state :stream-render-timer
+              (run-at-time agent-shell--stream-render-interval nil
+                           (lambda ()
+                             (map-put! state :stream-render-timer nil)
+                             (when-let* ((buffer (map-elt state :buffer))
+                                         ((buffer-live-p buffer)))
+                               (with-current-buffer buffer
+                                 (agent-shell--flush-stream-render state))))))))
+
+(defun agent-shell--cancel-stream-render-timer (state)
+  "Cancel STATE's pending stream render timer, if any."
+  (when-let* ((timer (map-elt state :stream-render-timer)))
+    (cancel-timer timer)
+    (map-put! state :stream-render-timer nil)))
+
+(defun agent-shell--render-streamed-chunk (state chunk)
+  "Append CHUNK to its streamed fragment in STATE.
+
+CHUNK is an alist like:
+
+  ((:namespace-id . \"1\")
+   (:block-id . \"1-agent_message_chunk\")
+   (:body . \"Hello world\")
+   (:create-new . t)
+   (:above-last-prompt . nil))"
+  (agent-shell--update-fragment
+   :state state
+   :namespace-id (map-elt chunk :namespace-id)
+   :block-id (map-elt chunk :block-id)
+   :body (map-elt chunk :body)
+   :append t
+   :create-new (map-elt chunk :create-new)
+   :navigation 'never
+   :render-body-images t
+   :above-last-prompt (map-elt chunk :above-last-prompt)))
+
+(defun agent-shell--flush-stream-render (state)
+  "Render STATE's pending streamed text, if any."
+  (when-let* ((pending (map-elt state :stream-render-pending)))
+    ;; Clear before rendering, which re-enters this flush.
+    (map-put! state :stream-render-pending nil)
+    (agent-shell--cancel-stream-render-timer state)
+    (agent-shell--render-streamed-chunk state pending)))
+
+(cl-defun agent-shell--update-streamed-fragment (&key state namespace-id block-id body
+                                                      create-new above-last-prompt)
+  "Append BODY to streamed fragment BLOCK-ID in STATE.
+
+NAMESPACE-ID, CREATE-NEW, and ABOVE-LAST-PROMPT follow
+`agent-shell--update-fragment'.  Chunks for the same fragment are
+batched while `agent-shell--stream-render-interval' is non-nil.  A
+different fragment or CREATE-NEW flushes the previous batch first."
+  (let ((chunk (list (cons :namespace-id namespace-id)
+                     (cons :block-id block-id)
+                     (cons :body body)
+                     (cons :create-new create-new)
+                     (cons :above-last-prompt above-last-prompt)))
+        (pending (map-elt state :stream-render-pending)))
+    (cond
+     ((not agent-shell--stream-render-interval)
+      (agent-shell--render-streamed-chunk state chunk))
+     ((and pending
+           (not create-new)
+           (equal (map-elt pending :namespace-id) namespace-id)
+           (equal (map-elt pending :block-id) block-id))
+      (map-put! pending :body (concat (map-elt pending :body) body)))
+     (t
+      (agent-shell--flush-stream-render state)
+      (map-put! state :stream-render-pending chunk)
+      (agent-shell--arm-stream-render-timer state)))))
+
 (cl-defun agent-shell--update-fragment (&key state namespace-id block-id label-left label-right
                                              body append create-new navigation expanded
                                              render-body-images above-last-prompt
@@ -5454,6 +5545,8 @@ Programmatic fragment updates do not enter undo history.
 GROUP-ID nests this block under a collapsible group header, materialized
 from GROUP-LABEL on first use (see `agent-shell-ui-make-fragment-model'),
 with GROUP-EXPANDED as the group's initial fold state."
+  ;; Streamed text lands before this fragment, never after it.
+  (agent-shell--flush-stream-render state)
   ;; A persistent prompt is live for the whole turn, so there is always one
   ;; to render above and every write goes there.  Callers decide
   ;; ABOVE-LAST-PROMPT from whether the shell is busy, which only tells
@@ -5660,6 +5753,7 @@ Lands above the live prompt while
 `agent-shell-persistent-prompt-enabled' is on, the same as
 `agent-shell--update-fragment'.  Without it this appends at `point-max',
 which mid-turn is past whatever the user is typing."
+  (agent-shell--flush-stream-render state)
   (let ((ns (or namespace-id (map-elt state :request-count))))
     (when-let* (((map-elt state :buffer))
                 (viewport-buffer (agent-shell-viewport--buffer
@@ -8208,6 +8302,8 @@ pending-restore state once replay completes."
                 ('full
                  (dolist (turn prompt-turns)
                    (agent-shell--replay-turn state turn))))
+              ;; Flush while history is still narrowed above the live prompt.
+              (agent-shell--flush-stream-render state)
               ;; Close a replay that ended on a user prompt.
               ;; `agent-shell--on-notification' terminates a replayed
               ;; `user_message_chunk' only when the next notification
@@ -9145,6 +9241,8 @@ reads the buffer's prompt capabilities."
                :prompt content-blocks)
      :buffer (current-buffer)
      :on-success (lambda (acp-response)
+                   ;; Before the turn-end footer scans the fragment bodies.
+                   (agent-shell--flush-stream-render (agent-shell--state))
                    (agent-shell--separate-transcript-after-agent-message
                     :last-entry-type (map-elt (agent-shell--state) :last-entry-type)
                     :file-path agent-shell--transcript-file)
@@ -9239,9 +9337,11 @@ Continue?" (agent-shell--prompt-queue-summary)))
 
 ;;; Projects
 
-(defun agent-shell-project-buffers ()
-  "Return all shell buffers in the same project as current buffer."
-  (let ((project-root (agent-shell-cwd)))
+(defun agent-shell-project-buffers (&optional cwd)
+  "Return all shell buffers in the same project as current buffer.
+
+CWD is the current buffer's `agent-shell-cwd', which is computed if nil."
+  (let ((project-root (or cwd (agent-shell-cwd))))
     (seq-filter (lambda (buffer)
                   (equal project-root
                          (with-current-buffer buffer
@@ -9263,11 +9363,16 @@ When NO-CREATE is non-nil, return existing shell or nil/error if none exists.
 When NO-ERROR is non-nil, return nil instead of raising an error.
 
 Returns a buffer object or nil."
-  (let ((shell-buffer (or (agent-shell-viewport--shell-buffer
-                           (or viewport-buffer (current-buffer)))
-                          (if (derived-mode-p 'agent-shell-mode)
-                              (current-buffer)
-                            (seq-first (agent-shell-project-buffers))))))
+  (let* (;; Computed only when looking for a shell in the current project,
+         ;; and reused when creating one (which only happens after that), since
+         ;; `agent-shell-cwd-function' may be expensive or interactive.
+         (cwd nil)
+         (shell-buffer (or (agent-shell-viewport--shell-buffer
+                            (or viewport-buffer (current-buffer)))
+                           (if (derived-mode-p 'agent-shell-mode)
+                               (current-buffer)
+                             (seq-first (agent-shell-project-buffers
+                                         (setq cwd (agent-shell-cwd))))))))
     (if shell-buffer
         shell-buffer
       (if no-create
@@ -9298,14 +9403,16 @@ Returns a buffer object or nil."
                                                   :prompt "Start new agent: ")
                                                  (error "No agent config found"))
                                      :no-focus t
-                                     :new-session t))))
+                                     :new-session t
+                                     :cwd cwd))))
           (agent-shell--start :config (or (agent-shell--auto-preferred-config)
                                           (agent-shell-select-config
                                            :prompt "Start new agent: ")
                                           (error "No agent config found"))
                               :no-focus t
                               :new-session t
-                              :session-strategy agent-shell-session-strategy))))))
+                              :session-strategy agent-shell-session-strategy
+                              :cwd cwd))))))
 
 (defun agent-shell-goto-last-interaction ()
   "Move point to the last interaction in the shell buffer."
