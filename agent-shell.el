@@ -4863,7 +4863,7 @@ displayed in no window is measured against the selected frame instead.
   (when-let* ((text)
               (available (- (window-body-width
                              (or (and buffer (get-buffer-window buffer t))
-                                 (frame-root-window)))
+                                 (frame-first-window)))
                             (or reserved 0))))
     (if (> (string-width text) available)
         (truncate-string-to-width text (max available 1) nil nil "…")
@@ -8251,102 +8251,119 @@ Notifications are dispatched through `agent-shell--on-notification'
 so they render as they would during a live turn.  Clears the
 pending-restore state once replay completes."
   (when-let* ((prompt-turns (agent-shell--pop-pending-restore state)))
-    ;; Pre-create bootstrapping placeholders so replayed
-    ;; notifications (e.g. `available_commands_update') update
-    ;; them in place instead of inserting at point-max — which
-    ;; would land past the restored conversation.
-    (agent-shell--create-bootstrapping-placeholders state)
-    ;; Temporarily restore the session/load request so handlers
-    ;; that gate on `:active-requests' (out-of-turn check,
-    ;; `user_message_chunk' rendering, etc.) treat the replayed
-    ;; notifications as if they arrived during the live load.
-    (let ((saved-active-requests (map-elt state :active-requests))
-          (agent-shell-ui--block-index (agent-shell-ui--make-block-index))
-          (count (length prompt-turns)))
-      (map-put! state :active-requests
-                (cons (list (cons :method "session/load")) saved-active-requests))
-      (unwind-protect
-          ;; A replay renders history the user never typed, so keep all of
-          ;; it out of undo history (see `agent-shell--reset-undo-history').
-          (let ((buffer-undo-list t)
-                (prompt-start (and comint-last-prompt
-                                   (marker-position (car comint-last-prompt))
-                                   (agent-shell--live-input-prompt-p comint-last-prompt)
-                                   (car comint-last-prompt))))
-            (when prompt-start
-              (set-marker-insertion-type prompt-start t))
-            (save-restriction
-              (when prompt-start
-                ;; Narrowing to exclude early prompt so all replayed
-                ;; history is rendered above/before the live prompt.
-                (narrow-to-region (point-min) (marker-position prompt-start)))
-              (pcase (agent-shell--effective-restore-verbosity state)
-                ('last
-                 (when (> count 1)
-                   (agent-shell--update-bootstrapping-fragment
-                    :state state
-                    :block-id "restore_truncated_history"
-                    :body (agent-shell--make-boxed-message
-                           :text "Note: truncated history (last only)")))
-                 (agent-shell--replay-turn state (car (last prompt-turns))))
-                ('first-last
-                 (agent-shell--replay-turn state (car prompt-turns))
-                 (when (> count 2)
-                   (agent-shell--update-bootstrapping-fragment
-                    :state state
-                    :block-id "restore_truncated_history"
-                    :body (agent-shell--make-boxed-message
-                           :text "Note: truncated history (first and last only)")))
-                 (when (> count 1)
-                   (agent-shell--replay-turn state (car (last prompt-turns)))))
-                ('full
-                 (dolist (turn prompt-turns)
-                   (agent-shell--replay-turn state turn))))
-              ;; Flush while history is still narrowed above the live prompt.
-              (agent-shell--flush-stream-render state)
-              ;; Close a replay that ended on a user prompt.
-              ;; `agent-shell--on-notification' terminates a replayed
-              ;; `user_message_chunk' only when the next notification
-              ;; arrives, emitting shell-maker's end-of-prompt marker so
-              ;; `shell-maker--extract-history' can pair the command with
-              ;; its response.  A session whose last turn is a user
-              ;; message (an interrupted request, whose final entry is the
-              ;; interruption notice) has no next notification, leaving
-              ;; the turn open: the live prompt renders on the same line
-              ;; as the restored user text, and the next unrelated
-              ;; notification (say `available_commands_update') emits the
-              ;; marker unnarrowed, landing it after the live prompt.
-              (when (equal (map-elt state :last-entry-type) "user_message_chunk")
-                (agent-shell--with-buffer-narrowed-to (agent-shell--live-prompt-start)
-                (shell-maker-insert-end-of-prompt-marker)
-                (let ((inhibit-read-only t))
-                  (goto-char (point-max))
-                  (insert (propertize "\n\n"
-                                      'field 'output
-                                      'read-only t
-                                      'front-sticky '(read-only)
-                                        'rear-nonsticky '(field read-only)))))
-                (map-put! state :last-entry-type nil))))
-        (map-put! state :active-requests saved-active-requests))
-      ;; Replay renders history as a live turn would, so the last replayed
-      ;; group is left expanded under `latest'.  Nothing is actually
-      ;; running, so fold it like a completed turn.
-      (agent-shell--collapse-expanded-activity-group state)
-      ;; Replayed history renders through the streaming path, which holds
-      ;; back an image or list item ending a message in case more of it
-      ;; follows.  No further notification is coming for it, so render it
-      ;; now, as at the end of a live turn.
-      (agent-shell--render-deferred-markup)
-      ;; Point followed the narrowed history insertions up above the live
-      ;; prompt.  Return it to the input area so the cursor lands where the
-      ;; user types (matching pre-early-prompt restore behavior).
-      (goto-char (point-max))
-      ;; The restored history landed above the early prompt, shifting any
-      ;; type-ahead down along with the undo entries recorded for it.
-      (agent-shell--reset-undo-history)
-      ;; The replayed conversation, including the live prompt, is now
-      ;; fully laid down; notify observers that the shell has settled.
-      (agent-shell--emit-event :event 'session-restored))))
+    (condition-case-unless-debug err
+        (progn
+          ;; Pre-create bootstrapping placeholders so replayed notifications
+          ;; (e.g. `available_commands_update') update them in place instead of
+          ;; inserting at point-max — which would land past the restored
+          ;; conversation.
+          (agent-shell--create-bootstrapping-placeholders state)
+          ;; Temporarily restore the session/load request so handlers
+          ;; that gate on `:active-requests' (out-of-turn check,
+          ;; `user_message_chunk' rendering, etc.) treat the replayed
+          ;; notifications as if they arrived during the live load.
+          (let ((saved-active-requests (map-elt state :active-requests))
+                (agent-shell-ui--block-index (agent-shell-ui--make-block-index))
+                (count (length prompt-turns)))
+            (map-put! state :active-requests
+                      (cons (list (cons :method "session/load")) saved-active-requests))
+            (unwind-protect
+                ;; A replay renders history the user never typed, so keep all of
+                ;; it out of undo history (see `agent-shell--reset-undo-history').
+                (let ((buffer-undo-list t)
+                      (prompt-start (and comint-last-prompt
+                                         (marker-position (car comint-last-prompt))
+                                         (agent-shell--live-input-prompt-p comint-last-prompt)
+                                         (car comint-last-prompt))))
+                  (when prompt-start
+                    (set-marker-insertion-type prompt-start t))
+                  (save-restriction
+                    (when prompt-start
+                      ;; Narrowing to exclude early prompt so all replayed
+                      ;; history is rendered above/before the live prompt.
+                      (narrow-to-region (point-min) (marker-position prompt-start)))
+                    (pcase (agent-shell--effective-restore-verbosity state)
+                      ('last
+                       (when (> count 1)
+                         (agent-shell--update-bootstrapping-fragment
+                          :state state
+                          :block-id "restore_truncated_history"
+                          :body (agent-shell--make-boxed-message
+                                 :text "Note: truncated history (last only)")))
+                       (agent-shell--replay-turn state (car (last prompt-turns))))
+                      ('first-last
+                       (agent-shell--replay-turn state (car prompt-turns))
+                       (when (> count 2)
+                         (agent-shell--update-bootstrapping-fragment
+                          :state state
+                          :block-id "restore_truncated_history"
+                          :body (agent-shell--make-boxed-message
+                                 :text "Note: truncated history (first and last only)")))
+                       (when (> count 1)
+                         (agent-shell--replay-turn state (car (last prompt-turns)))))
+                      ('full
+                       (dolist (turn prompt-turns)
+                         (agent-shell--replay-turn state turn))))
+                    ;; Flush while history is still narrowed above the live prompt.
+                    (agent-shell--flush-stream-render state)
+                    ;; Close a replay that ended on a user prompt.
+                    ;; `agent-shell--on-notification' terminates a replayed
+                    ;; `user_message_chunk' only when the next notification
+                    ;; arrives, emitting shell-maker's end-of-prompt marker so
+                    ;; `shell-maker--extract-history' can pair the command with
+                    ;; its response.  A session whose last turn is a user
+                    ;; message (an interrupted request, whose final entry is the
+                    ;; interruption notice) has no next notification, leaving
+                    ;; the turn open: the live prompt renders on the same line
+                    ;; as the restored user text, and the next unrelated
+                    ;; notification (say `available_commands_update') emits the
+                    ;; marker unnarrowed, landing it after the live prompt.
+                    (when (equal (map-elt state :last-entry-type) "user_message_chunk")
+                      (agent-shell--with-buffer-narrowed-to (agent-shell--live-prompt-start)
+                        (shell-maker-insert-end-of-prompt-marker)
+                        (let ((inhibit-read-only t))
+                          (goto-char (point-max))
+                          (insert (propertize "\n\n"
+                                              'field 'output
+                                              'read-only t
+                                              'front-sticky '(read-only)
+                                              'rear-nonsticky '(field read-only)))))
+                      (map-put! state :last-entry-type nil))))
+              (map-put! state :active-requests saved-active-requests))
+            ;; Replay renders history as a live turn would, so the last replayed
+            ;; group is left expanded under `latest'.  Nothing is actually
+            ;; running, so fold it like a completed turn.
+            (agent-shell--collapse-expanded-activity-group state)
+            ;; Replayed history renders through the streaming path, which holds
+            ;; back an image or list item ending a message in case more of it
+            ;; follows.  No further notification is coming for it, so render it
+            ;; now, as at the end of a live turn.
+            (agent-shell--render-deferred-markup)))
+      (error (agent-shell--report-restore-error :state state :err err)))
+    ;; Point followed the narrowed history insertions up above the live prompt.
+    ;; Return it to the input area so the cursor lands where the user types
+    ;; (matching pre-early-prompt restore behavior).
+    (goto-char (point-max))
+    ;; The restored history landed above the early prompt, shifting any
+    ;; type-ahead down along with the undo entries recorded for it.
+    (agent-shell--reset-undo-history)
+    ;; The replayed conversation, including the live prompt, is now fully laid
+    ;; down; notify observers that the shell has settled.
+    (agent-shell--emit-event :event 'session-restored)))
+
+(cl-defun agent-shell--report-restore-error (&key state err)
+  "Report ERR, signaled rendering STATE's restored history.
+
+Shows ERR in the echo area and in a warning above the prompt.  The
+history rendered before ERR was signaled stays in the shell."
+  (let ((text (format "Couldn't render restored history: %s"
+                      (error-message-string err))))
+    (message "%s" text)
+    (agent-shell--update-bootstrapping-fragment
+     :state state
+     :block-id "restore_failed"
+     :body (agent-shell--make-boxed-message
+            :text (concat "Warning: " text)))))
 
 (cl-defun agent-shell--resume-failure-message (&key session-id)
   "Return the message reporting SESSION-ID couldn't be resumed.

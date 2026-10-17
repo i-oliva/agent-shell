@@ -4379,6 +4379,93 @@ other unknown ones."
         (should session-init-called)
         (should (equal (map-nested-elt agent-shell--state '(:session :id)) "new-session-789"))))))
 
+(ert-deftest agent-shell--handle-finishes-init-when-restore-render-fails ()
+  "Test a failure rendering a `session/load' replay still finishes init.
+
+The replay renders from the load's success handler, whose errors the
+ACP client only logs.  If one escaped, the shell would never stop its
+busy indicator or emit `prompt-ready'.  It is reported in the shell
+instead."
+  (let* ((shell-buffer (generate-new-buffer " *agent-shell-restore-error-test*"))
+         (heartbeat (agent-shell-heartbeat-make :on-heartbeat #'ignore))
+         (events nil)
+         (fragments nil)
+         ;; ERT binds `debug-on-error', under which the error is
+         ;; signaled for the debugger to catch.
+         (debug-on-error nil)
+         (agent-shell-session-restore-verbosity 'first-last))
+    (unwind-protect
+        (with-current-buffer shell-buffer
+          (setq major-mode 'agent-shell-mode)
+          ;; Built with `list'/`cons' so `map-put!' can mutate in place.
+          (setq-local agent-shell--state
+                      (list (cons :buffer shell-buffer)
+                            (cons :client (list (cons :request-handlers '(ignore))
+                                                (cons :notification-handlers '(ignore))
+                                                (cons :error-handlers '(ignore))))
+                            (cons :initialized t)
+                            (cons :request-count 0)
+                            (cons :last-activity-time nil)
+                            (cons :heartbeat heartbeat)
+                            (cons :session (list (cons :id nil)
+                                                 (cons :mode-id nil)
+                                                 (cons :modes nil)))
+                            (cons :resume-session-id "session-123")
+                            (cons :supports-session-load t)
+                            (cons :pending-restore (agent-shell--make-pending-restore))
+                            (cons :active-requests nil)
+                            (cons :last-entry-type nil)
+                            (cons :event-subscriptions nil)))
+          (agent-shell-subscribe-to
+           :shell-buffer shell-buffer
+           :on-event (lambda (event)
+                       (push (map-elt event :event) events)))
+          (agent-shell-heartbeat-start :heartbeat heartbeat)
+          (cl-letf (((symbol-function 'agent-shell--update-fragment)
+                     (lambda (&rest args)
+                       (push (cons (plist-get args :block-id) (plist-get args :body))
+                             fragments)))
+                    ((symbol-function 'agent-shell--update-header-and-mode-line)
+                     #'ignore)
+                    ((symbol-function 'agent-shell--finish-output) #'ignore)
+                    ((symbol-function 'agent-shell-cwd) (lambda () "/tmp"))
+                    ((symbol-function 'agent-shell--resolve-path) #'identity)
+                    ((symbol-function 'agent-shell--mcp-servers) (lambda () []))
+                    ((symbol-function 'agent-shell--replay-turn) #'ignore)
+                    ;; Where the original failure surfaced: rendering a
+                    ;; replayed table under a narrowing.
+                    ((symbol-function 'agent-shell--render-deferred-markup)
+                     (lambda () (signal 'args-out-of-range '(42160))))
+                    ((symbol-function 'acp-send-request)
+                     (lambda (&rest args)
+                       (let ((method (map-elt (plist-get args :request) :method)))
+                         (unless (equal method "session/load")
+                           (error "Unexpected method: %s" method))
+                         ;; The agent replays the conversation before it
+                         ;; answers the request.
+                         (agent-shell--on-notification
+                          :state agent-shell--state
+                          :acp-notification (agent-shell-tests--make-session-update
+                                             "user_message_chunk" "Hello"))
+                         (funcall (plist-get args :on-success)
+                                  '((sessionId . "session-123")))))))
+            (agent-shell--handle :shell-buffer shell-buffer))
+          (should (eq (map-elt heartbeat :status) 'ended))
+          (should (equal (map-nested-elt agent-shell--state '(:session :id)) "session-123"))
+          (should (map-elt agent-shell--state :init-finished))
+          (should-not (map-elt agent-shell--state :pending-restore))
+          (should-not (map-elt agent-shell--state :active-requests))
+          (should (equal (seq-filter (lambda (event)
+                                       (memq event '(init-session session-restored
+                                                                  prompt-ready init-finished)))
+                                     (reverse events))
+                         '(init-session session-restored prompt-ready init-finished)))
+          (should (string-match-p
+                   (regexp-quote "Warning: Couldn't render restored history: Args out of range: 42160")
+                   (or (map-elt fragments "restore_failed") ""))))
+      (agent-shell-heartbeat-stop :heartbeat heartbeat)
+      (kill-buffer shell-buffer))))
+
 (ert-deftest agent-shell--outgoing-request-decorator-reaches-client ()
   "Test that :outgoing-request-decorator from state reaches the ACP client."
   (with-temp-buffer
@@ -8150,6 +8237,20 @@ command would otherwise flash as a block before the description lands."
                                                          (:description . "Build it"))))))
                               "t1")
                              :title))))))
+
+(ert-deftest agent-shell--fit-to-window-line-undisplayed-on-split-frame-test ()
+  "A buffer shown in no window is measured against a live window.
+
+On a split frame, the root window is an internal window, which has no
+body to measure."
+  (save-window-excursion
+    (delete-other-windows)
+    (split-window-right)
+    (with-temp-buffer
+      (should-not (get-buffer-window (current-buffer) t))
+      (should (equal "cd /tmp"
+                     (agent-shell--fit-to-window-line
+                      :text "cd /tmp" :buffer (current-buffer)))))))
 
 (ert-deftest agent-shell--tag-untagged-output-tags-same-chars-test ()
   "Tagging only the untagged tail covers what a whole-range tag would."

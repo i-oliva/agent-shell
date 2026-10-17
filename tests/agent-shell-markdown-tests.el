@@ -3546,6 +3546,17 @@ returns (agent-shell-markdown-table agent-shell-markdown-table-zebra)."
   (should (stringp
            (agent-shell-markdown--table-apply-height-scaling "⚠️ Review"))))
 
+(ert-deftest agent-shell-markdown-table-measure-line-height-leaves-window-alone ()
+  ;; Regression: measuring must not show its buffer in the window, which
+  ;; would run the window's hooks in the middle of rendering.
+  (let* ((calls 0)
+         (window-scroll-functions (list (lambda (&rest _) (setq calls (1+ calls)))))
+         (buffer (window-buffer)))
+    (save-window-excursion
+      (agent-shell-markdown--table-measure-line-height (selected-window) "A")
+      (should (eq (window-buffer) buffer))
+      (should (= calls 0)))))
+
 (ert-deftest agent-shell-markdown-table-next-cell-walks-cells-in-order ()
   ;; Cells walk row-by-row, skipping the separator, and signal
   ;; `user-error' at the table boundary.

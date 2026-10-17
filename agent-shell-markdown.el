@@ -2776,9 +2776,8 @@ scripts with tall ascenders/descenders like Arabic (~0.63).")
 (defun agent-shell-markdown--table-measure-line-height (win str)
   "Return the rendered pixel height of STR as a single line in WIN."
   (with-temp-buffer
-    (set-window-buffer win (current-buffer))
     (insert str "\n")
-    (cdr (window-text-pixel-size win 1 3))))
+    (cdr (buffer-text-pixel-size nil win))))
 
 (defun agent-shell-markdown--table-char-height-scale (char)
   "Return the display height scale needed for CHAR, or nil if none.
@@ -2797,22 +2796,19 @@ brings the glyph back to the default height.  Results are cached."
                          'miss)))
     (if (eq cached 'miss)
         (let ((scale
-               (let ((win (selected-window))
-                     (orig-buf (window-buffer)))
-                 (unwind-protect
-                     (let* ((default-h
-                             (or agent-shell-markdown--table-default-line-height
-                                 (setq agent-shell-markdown--table-default-line-height
-                                       (agent-shell-markdown--table-measure-line-height
-                                        win "A"))))
-                            (char-h (agent-shell-markdown--table-measure-line-height
-                                     win (string char))))
-                       (when (> char-h default-h)
-                         (let ((ratio (/ (float default-h) char-h)))
-                           (and (>= ratio
-                                    agent-shell-markdown--table-min-height-scale)
-                                ratio))))
-                   (set-window-buffer win orig-buf)))))
+               (let* ((win (selected-window))
+                      (default-h
+                       (or agent-shell-markdown--table-default-line-height
+                           (setq agent-shell-markdown--table-default-line-height
+                                 (agent-shell-markdown--table-measure-line-height
+                                  win "A"))))
+                      (char-h (agent-shell-markdown--table-measure-line-height
+                               win (string char))))
+                 (when (> char-h default-h)
+                   (let ((ratio (/ (float default-h) char-h)))
+                     (and (>= ratio
+                              agent-shell-markdown--table-min-height-scale)
+                          ratio))))))
           (puthash char scale agent-shell-markdown--table-height-scale-cache)
           scale)
       cached)))
