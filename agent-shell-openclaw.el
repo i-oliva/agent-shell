@@ -29,7 +29,6 @@
   (require 'cl-lib))
 (require 'shell-maker)
 (require 'acp)
-(defvar agent-shell-context-sources)
 
 (declare-function agent-shell--indent-string "agent-shell")
 (declare-function agent-shell-welcome-message "agent-shell")
@@ -92,10 +91,8 @@ Returns an agent configuration alist using `agent-shell-make-agent-config'."
 (defun agent-shell-openclaw-start-agent ()
   "Start an interactive OpenClaw agent shell."
   (interactive)
-  ;; Keep leader-key popup text out of the initial Gateway prompt.
-  (let ((agent-shell-context-sources '(files region error)))
-    (agent-shell--dwim :config (agent-shell-openclaw-make-agent-config)
-                       :new-shell t)))
+  (agent-shell--dwim :config (agent-shell-openclaw-make-agent-config)
+                     :new-shell t))
 
 (cl-defun agent-shell-openclaw-make-client (&key buffer)
   "Create an OpenClaw ACP client using BUFFER as context."
@@ -129,26 +126,6 @@ Returns an agent configuration alist using `agent-shell-make-agent-config'."
     (propertize text 'font-lock-face (if is-dark
                                          '(:foreground "#FF5A2D" :inherit fixed-pitch)
                                        '(:foreground "#D14A22" :inherit fixed-pitch)))))
-
-(defun agent-shell-openclaw--load-error-a (original &rest args)
-  "Keep a failed OpenClaw restore in its selected conversation.
-ORIGINAL receives the request keyword ARGS."
-  (let ((state (plist-get args :state))
-        (request (plist-get args :request)))
-    (when (and (eq (map-nested-elt state '(:agent-config :identifier)) 'openclaw)
-               (member (map-elt request :method) '("session/load" "session/resume")))
-      (let ((handler (agent-shell--make-error-handler
-                      :state state :shell-buffer (map-elt state :buffer))))
-        (setq args
-              (plist-put args :on-failure
-                         (lambda (err raw)
-                           (map-put! state :pending-restore nil)
-                           (funcall handler err raw))))))
-    (apply original args)))
-
-(with-eval-after-load 'agent-shell
-  (unless (advice-member-p #'agent-shell-openclaw--load-error-a 'agent-shell--send-request)
-    (advice-add 'agent-shell--send-request :around #'agent-shell-openclaw--load-error-a)))
 
 (provide 'agent-shell-openclaw)
 

@@ -202,8 +202,7 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                  ;; it still describes the buffer.
                  (cached (unless create-new
                            (agent-shell-ui--cached-block qualified-id)))
-                 (match (unless (or cached create-new
-                                    (not (agent-shell-ui--block-may-exist-p qualified-id)))
+                 (match (unless cached
                           (save-mark-and-excursion
                             (goto-char (point-max))
                             (text-property-search-backward
@@ -667,14 +666,13 @@ When NO-UNDO is non-nil, disable undo recording for this operation."
     (let* ((inhibit-read-only t)
            (buffer-undo-list (if no-undo t buffer-undo-list))
            (qualified-id (format "%s-%s" namespace-id block-id))
-           (match (when (agent-shell-ui--block-may-exist-p qualified-id)
-                    (save-mark-and-excursion
-                      (goto-char (point-max))
-                      (text-property-search-backward
-                       'agent-shell-ui-state nil
-                       (lambda (_ state)
-                         (equal (map-elt state :qualified-id) qualified-id))
-                       t)))))
+           (match (save-mark-and-excursion
+                    (goto-char (point-max))
+                    (text-property-search-backward
+                     'agent-shell-ui-state nil
+                     (lambda (_ state)
+                       (equal (map-elt state :qualified-id) qualified-id))
+                     t))))
       (when match
         (let ((block-start (prop-match-beginning match))
               (block-end (prop-match-end match)))
@@ -705,35 +703,6 @@ In the form:
      :value qualified-id
      :predicate (lambda (qualified-id property)
                   (equal (map-elt property :qualified-id) qualified-id)))))
-
-(defvar agent-shell-ui--block-index nil
-  "Optional (BUFFER . IDS) index bound during a controlled history replay.
-IDS records blocks present at the start or inserted during the replay.
-Discard it afterwards: arbitrary buffer edits can introduce other IDs.
-It tracks existence only; the bounded marker cache still locates blocks.")
-
-(defun agent-shell-ui--make-block-index ()
-  "Index the current buffer's existing block IDs for a history replay."
-  (let ((ids (make-hash-table :test 'equal))
-        (pos (point-min)))
-    (while (< pos (point-max))
-      (when-let* ((id (map-elt (get-text-property pos 'agent-shell-ui-state)
-                               :qualified-id)))
-        (puthash id t ids))
-      (setq pos (next-single-property-change pos 'agent-shell-ui-state nil (point-max))))
-    (cons (current-buffer) ids)))
-
-(defun agent-shell-ui--block-may-exist-p (qualified-id)
-  "Return nil only when the replay index rules out QUALIFIED-ID.
-Outside the indexed buffer, use the normal property search."
-  (or (not (eq (car agent-shell-ui--block-index) (current-buffer)))
-      (gethash qualified-id (cdr agent-shell-ui--block-index))))
-
-(defun agent-shell-ui--index-block (qualified-id)
-  "Remember an inserted QUALIFIED-ID in the current replay index.
-Deleted IDs can remain: a false positive only triggers a normal search."
-  (when (eq (car agent-shell-ui--block-index) (current-buffer))
-    (puthash qualified-id t (cdr agent-shell-ui--block-index))))
 
 (defvar-local agent-shell-ui--block-cache nil
   "Markers for the blocks most recently updated in this buffer.
@@ -890,8 +859,7 @@ so it costs whatever sits above the group, and a collapsed group looks
 its header up several times per child update: without the cache a
 turn's cost grew with everything already in the buffer (issue #757)."
   (or (agent-shell-ui--cached-group-header group-qualified-id)
-      (when-let* (((agent-shell-ui--block-may-exist-p group-qualified-id))
-                  (match (save-mark-and-excursion
+      (when-let* ((match (save-mark-and-excursion
                            (goto-char (point-min))
                            (text-property-search-forward
                             'agent-shell-ui-state nil
@@ -1097,7 +1065,6 @@ A group header (MODEL `:kind' `group') gets a fold triangle and no body of
 its own; its children render below it as separate fragments tagged with its
 qualified-id via `:group-qualified-id'.  MODEL `:group-indent' visually
 indents a child's header line under its group header."
-  (agent-shell-ui--index-block qualified-id)
   (let* ((block-start (point))
          (kind (map-elt model :kind))
          (group (eq kind 'group))
@@ -1257,17 +1224,14 @@ When NO-UNDO is non-nil, disable undo recording."
            (props `(agent-shell-ui-state ((:qualified-id . ,qualified-id))
                                          read-only t
                                          front-sticky (read-only)))
-           (match (when (and (not create-new)
-                            (agent-shell-ui--block-may-exist-p qualified-id))
-                    (save-mark-and-excursion
-                      (goto-char (point-max))
-                      (text-property-search-backward
-                       'agent-shell-ui-state nil
-                       (lambda (_ state)
-                         (equal (map-elt state :qualified-id) qualified-id))
-                       t)))))
+           (match (save-mark-and-excursion
+                    (goto-char (point-max))
+                    (text-property-search-backward
+                     'agent-shell-ui-state nil
+                     (lambda (_ state)
+                       (equal (map-elt state :qualified-id) qualified-id))
+                     t))))
       (when text
-        (agent-shell-ui--index-block qualified-id)
         (cond
          ;; Append to existing entry.
          ((and match (not create-new) append)

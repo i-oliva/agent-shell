@@ -63,7 +63,6 @@
 (require 'agent-shell-faces)
 (require 'agent-shell-markdown)
 (require 'agent-shell-antigravity)
-(require 'agent-shell-mermaid)
 (require 'agent-shell-anthropic)
 (require 'agent-shell-auggie)
 (require 'agent-shell-block-motion)
@@ -8263,7 +8262,6 @@ pending-restore state once replay completes."
           ;; `user_message_chunk' rendering, etc.) treat the replayed
           ;; notifications as if they arrived during the live load.
           (let ((saved-active-requests (map-elt state :active-requests))
-                (agent-shell-ui--block-index (agent-shell-ui--make-block-index))
                 (count (length prompt-turns)))
             (map-put! state :active-requests
                       (cons (list (cons :method "session/load")) saved-active-requests))
