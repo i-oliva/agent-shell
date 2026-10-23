@@ -444,8 +444,8 @@ streaming **not bold**" nil)))))
 `get-pos-property' reports what text inserted at a position would
 inherit rather than what sits there.  Unless the span is
 rear-nonsticky the hint still answers one position past its end, so a
-link's \"Press RET to open in browser\" shows while point sits on the
-space after the link."
+link's \"Press RET to open in browser: ...\" shows while point sits on
+the space after the link."
   (with-temp-buffer
     (insert "see [wool.com](https://wool.com/x) ok\n\n"
             "| A | L |\n|---|---|\n| x | [j.com](https://j.com/y) |\n\n"
@@ -689,7 +689,8 @@ it is still picked up by the bare-URL linkifier."
                  (setq echoed (apply #'format format-string args)))))
       (funcall (seq-first (get-text-property 0 'cursor-sensor-functions rendered))
                nil nil 'entered)
-      (should (equal "Press RET to open image in browser" echoed)))))
+      (should (equal "Press RET to open image in browser: https://example.com/a.png"
+                     echoed)))))
 
 (ert-deftest agent-shell-markdown-link-hints-where-it-lands ()
   ;; A link looks actionable (link face), but not where invoking it goes: `agent-shell-markdown--open-link' visits local
@@ -707,13 +708,15 @@ it is still picked up by the bare-URL linkifier."
             (funcall (seq-first (get-text-property
                                  0 'cursor-sensor-functions rendered))
                      nil nil 'entered)
-            (should (equal "Press RET to open file" echoed)))
+            (should (equal (format "Press RET to open file: %s" linked-file)
+                           echoed)))
           (let ((rendered (agent-shell-markdown-convert
                            "[docs](https://example.com)")))
             (funcall (seq-first (get-text-property
                                  0 'cursor-sensor-functions rendered))
                      nil nil 'entered)
-            (should (equal "Press RET to open in browser" echoed))))
+            (should (equal "Press RET to open in browser: https://example.com"
+                           echoed))))
       (delete-file linked-file))))
 
 (ert-deftest agent-shell-markdown-link-help-echo-says-where-it-lands ()
@@ -723,20 +726,20 @@ it is still picked up by the bare-URL linkifier."
   (let ((linked-file (make-temp-file "agent-shell-test" nil ".el")))
     (unwind-protect
         (progn
-          (should (equal "Open file"
+          (should (equal (format "Open file: %s" linked-file)
                          (funcall (get-text-property
                                    0 'help-echo
                                    (agent-shell-markdown-convert
                                     (format "[code](%s)" linked-file)))
                                   nil nil 0)))
-          (should (equal "Open in browser"
+          (should (equal "Open in browser: https://example.com"
                          (funcall (get-text-property
                                    0 'help-echo
                                    (agent-shell-markdown-convert
                                     "[docs](https://example.com)"))
                                   nil nil 0)))
           ;; A remote image falling back to a link keeps its own wording.
-          (should (equal "Open image in browser"
+          (should (equal "Open image in browser: https://example.com/a.png"
                          (funcall (get-text-property
                                    0 'help-echo
                                    (agent-shell-markdown-convert
@@ -2823,7 +2826,8 @@ after" nil)))))
         (funcall (seq-first (get-text-property
                              link-start 'cursor-sensor-functions rendered))
                  nil nil 'entered)
-        (should (equal "Press RET to open in browser" echoed))))))
+        (should (equal "Press RET to open in browser: https://example.com"
+                       echoed))))))
 
 (ert-deftest agent-shell-markdown-convert-table-skips-frozen-cell-pipe ()
   ;; `| `a|b` | c |' — inline-code body contains a `|', which our

@@ -6100,6 +6100,7 @@ Returns the resulting buffer string, with the live prompt trailing."
                        (lambda (_state) 'last))
                       ((symbol-function 'agent-shell--replay-turn)
                        (lambda (state _turn)
+                         (should-not (shell-maker--should-auto-scroll-p))
                          (let ((inhibit-read-only t))
                            (goto-char (point-max))
                            (insert "Claude> replayed"))
@@ -7112,6 +7113,16 @@ tense while any member is still unfinished."
     (should (equal "a.el" (agent-shell--raw-input-file-path
                           (list (cons key "a.el")))))))
 
+(ert-deftest agent-shell--raw-input-command-test ()
+  "Read the command under either key and normalize argv vectors."
+  (should (equal "ls -la" (agent-shell--raw-input-command
+                           '((command . "ls -la")))))
+  (should (equal "ls -la" (agent-shell--raw-input-command
+                           '((command_line . "ls -la") (working_dir . "/tmp")))))
+  (should (equal "ls -la" (agent-shell--raw-input-command
+                           '((command . ["ls" "-la"])))))
+  (should-not (agent-shell--raw-input-command '((path . "a.el")))))
+
 (ert-deftest agent-shell--activity-group-edit-file-count-test ()
   "Edit summaries count distinct files and handle missing paths."
   (let ((call '((:kind . "edit") (:status . "completed")
@@ -7308,6 +7319,46 @@ such a body layers its own faces ahead of the base one."
                     :acp-notification '((some-key . "some-value")))
                   '((adapted . t) (some-key . "some-value"))))))
 
+(ert-deftest agent-shell--subscribe-to-client-events-notification-handler-test ()
+  "Test adapter, provider handler and core run in order.
+A handled notification skips core but still records activity."
+  (dolist (handled '(nil t))
+    (with-temp-buffer
+      (let* ((calls nil)
+             (handler-state nil)
+             (state (agent-shell--make-state
+                     :buffer (current-buffer)
+                     :agent-config
+                     (agent-shell-make-agent-config
+                      :identifier 'test
+                      :notification-adapter
+                      (lambda (&rest args)
+                        (push 'adapter calls)
+                        (cons '(adapted . t) (plist-get args :acp-notification)))
+                      :notification-handler
+                      (lambda (event)
+                        (setq handler-state (map-elt event :state))
+                        (should (map-nested-elt event '(:acp-notification adapted)))
+                        (push 'handler calls)
+                        handled)))))
+        (map-put! state :client (acp-make-client
+                                :command "unused"
+                                :context-buffer (current-buffer)))
+        (cl-letf (((symbol-function 'agent-shell--on-notification)
+                   (lambda (&rest args)
+                     (should (map-elt (plist-get args :acp-notification) 'adapted))
+                     (push 'core calls))))
+          (agent-shell--subscribe-to-client-events :state state)
+          (dolist (handler (map-nested-elt state '(:client :notification-handlers)))
+            (funcall handler '((method . "_example/status")))))
+        (should (eq handler-state state))
+        ;; Core is stubbed, so only a handled notification records activity.
+        (should (eq (and (map-elt state :last-activity-time) t) handled))
+        (should (equal (reverse calls)
+                       (if handled
+                           '(adapter handler)
+                         '(adapter handler core))))))))
+
 (ert-deftest agent-shell--buffer-name-prefix-test ()
   "Test `agent-shell--buffer-name-prefix' across formats."
   (let ((agent-shell-buffer-name-format 'default))
@@ -7354,6 +7405,77 @@ such a body layers its own faces ahead of the base one."
           (insert "streamed")
           (put-text-property out-start (point) 'field 'output))
         (should-not (agent-shell--live-input-prompt-p prompt))))))
+
+(ert-deftest agent-shell--prompt-face-p-test ()
+  "Prompt runs are recognized whether the face is a symbol or a list."
+  (should (agent-shell--prompt-face-p 'comint-highlight-prompt))
+  (should (agent-shell--prompt-face-p 'agent-shell-prompt))
+  (should (agent-shell--prompt-face-p '(comint-highlight-prompt comint-highlight-prompt)))
+  (should-not (agent-shell--prompt-face-p 'default))
+  (should-not (agent-shell--prompt-face-p nil)))
+
+(ert-deftest agent-shell-prompt-ranges-test ()
+  "`agent-shell-prompt-ranges' finds typed, replayed, steered and live prompts."
+  (with-temp-buffer
+    (let ((marker (propertize "<shell-maker-end-of-prompt>"
+                              'invisible t 'shell-maker--marker t)))
+      ;; Typed at the shell.
+      (insert (propertize "Claude> " 'font-lock-face
+                          '(comint-highlight-prompt comint-highlight-prompt)
+                          'field 'output)
+              (propertize "typed" 'font-lock-face 'comint-highlight-input)
+              "\n" marker
+              ;; Quoted marker text without the property is not a boundary.
+              "reply <shell-maker-end-of-prompt>\n\n")
+      ;; Replayed by a restored session.
+      (insert (propertize "Claude> " 'font-lock-face
+                          '(agent-shell-prompt comint-highlight-prompt)
+                          'field 'output)
+              (propertize "replayed" 'font-lock-face 'agent-shell-input)
+              marker "\n\n")
+      ;; Steered into a running turn.
+      (insert (propertize "Claude> " 'font-lock-face 'agent-shell-prompt
+                          'field 'output)
+              (propertize "[steer] steered" 'font-lock-face 'agent-shell-input)
+              marker "\n\n")
+      ;; Live, still being typed into.
+      (insert (propertize "Claude> " 'font-lock-face 'comint-highlight-prompt
+                          'field 'output)
+              "draft"))
+    (should (equal (seq-map (lambda (range)
+                              (list (buffer-substring-no-properties
+                                     (map-elt range :prompt-start)
+                                     (map-elt range :prompt-end))
+                                    (buffer-substring-no-properties
+                                     (map-elt range :input-start)
+                                     (map-elt range :input-end))))
+                            (agent-shell-prompt-ranges))
+                   '(("Claude> " "typed\n")
+                     ("Claude> " "replayed")
+                     ("Claude> " "[steer] steered")
+                     ("Claude> " "draft"))))))
+
+(ert-deftest agent-shell-prompt-ranges-field-test ()
+  "Only prompt-faced text ending an `output' field is a prompt.
+A response quoting a prompt in prompt face is not one."
+  (with-temp-buffer
+    (insert (propertize (concat "Quoting "
+                                (propertize "Claude> " 'font-lock-face
+                                            'comint-highlight-prompt)
+                                "in a reply\n")
+                        'field 'output)
+            (propertize "Claude> " 'font-lock-face 'comint-highlight-prompt
+                        'field 'output)
+            "draft")
+    (should (equal (seq-map (lambda (range)
+                              (list (buffer-substring-no-properties
+                                     (map-elt range :prompt-start)
+                                     (map-elt range :prompt-end))
+                                    (buffer-substring-no-properties
+                                     (map-elt range :input-start)
+                                     (map-elt range :input-end))))
+                            (agent-shell-prompt-ranges))
+                   '(("Claude> " "draft"))))))
 
 (ert-deftest agent-shell--live-input-prompt-p-narrowed-above-prompt-test ()
   "Guard against inverted `text-property-any' bounds while narrowed.
@@ -8247,6 +8369,26 @@ the global hook value must stay quiet."
                     0 'font-lock-face
                     (map-elt (agent-shell-make-tool-call-label state "t1") :title))))))
 
+(ert-deftest agent-shell-make-tool-call-label-dims-read-line-range-test ()
+  "A read's trailing line range renders as an annotation beside its path."
+  (let ((title (lambda (kind text)
+                 (map-elt (agent-shell-make-tool-call-label
+                           `((:tool-calls . (("t1" . ((:kind . ,kind)
+                                                      (:status . "completed")
+                                                      (:title . ,text))))))
+                           "t1")
+                          :title))))
+    (let ((label (funcall title "read" "file.el (1455 - 1476)")))
+      (should (equal 'default (get-text-property 0 'font-lock-face label)))
+      (should (equal 'agent-shell-section-annotation
+                     (get-text-property (string-search "(" label)
+                                        'font-lock-face label))))
+    ;; Other kinds keep their parens plain.
+    (let ((label (funcall title "edit" "file.el (1455 - 1476)")))
+      (should (equal 'default
+                     (get-text-property (string-search "(" label)
+                                        'font-lock-face label))))))
+
 (ert-deftest agent-shell-make-tool-call-label-multiline-command-test ()
   "A multiline command reads as truncated, so its title ends in an ellipsis.
 
@@ -8491,6 +8633,84 @@ would ever render it."
                                      (buffer-substring-no-properties
                                       (point-min) (point-max))))))
       (delete-file image-file))))
+
+(ert-deftest agent-shell--render-deferred-markup-resets-undo-history-test ()
+  "Undo after a turn ending in a table undoes what was typed at the prompt.
+
+The table's last row has no newline, so it renders only at the end of
+the turn, re-laying out the table above the prompt.  Undo entries hold
+absolute positions, so the input typed in the meantime moves away from
+them.  Without a reset, undo would edit the table instead."
+  (should (equal
+           (agent-shell-tests--with-persistent-prompt-shell
+            (lambda ()
+              (buffer-enable-undo)
+              (let ((agent-shell-show-busy-indicator nil)
+                    (agent-shell-show-usage-at-turn-end nil)
+                    (on-success nil))
+                (cl-letf (((symbol-function 'agent-shell--send-request)
+                           (lambda (&rest args)
+                             (setq on-success (plist-get args :on-success))))
+                          ((symbol-function 'agent-shell--prompt-queue-process-next)
+                           #'ignore)
+                          ((symbol-function 'shell-maker--write-input-ring-history)
+                           #'ignore))
+                  (agent-shell--send-command :prompt "list the files"
+                                             :shell-buffer (current-buffer))
+                  (agent-shell--update-fragment
+                   :state agent-shell--state
+                   :block-id "agent-message"
+                   :body "| A |\n|---|\n| longer value |"
+                   :create-new t)
+                  (goto-char (point-max))
+                  (insert "draft")
+                  (undo-boundary)
+                  (funcall on-success '((stopReason . "end_turn")))
+                  ;; Stands in for the command loop, which boundaries the
+                  ;; undo list before running the undo command.
+                  (undo-boundary)
+                  (undo)
+                  (list (cons :prompt-input (agent-shell--prompt-input))
+                        (cons :table-intact (and (string-match-p
+                                                  "│ longer value │" (buffer-string))
+                                                 t)))))))
+           '((:prompt-input . nil) (:table-intact . t)))))
+
+(ert-deftest agent-shell--delete-fragment-resets-undo-history-test ()
+  "Undo after a fragment is deleted undoes what was typed at the prompt.
+
+Deleting a fragment above the prompt (a resolved permission request,
+say) pulls the input typed in the meantime up, away from the absolute
+positions its undo entries hold.  Without a reset, undo would edit the
+output above the prompt instead."
+  (should (equal
+           (agent-shell-tests--with-persistent-prompt-shell
+            (lambda ()
+              (buffer-enable-undo)
+              (agent-shell--update-fragment
+               :state agent-shell--state
+               :block-id "agent-message"
+               :body "Some agent output"
+               :create-new t)
+              (agent-shell--update-fragment
+               :state agent-shell--state
+               :block-id "permission"
+               :body "Allow this?"
+               :create-new t)
+              (goto-char (point-max))
+              (insert "draft")
+              (undo-boundary)
+              (agent-shell--delete-fragment :state agent-shell--state
+                                            :block-id "permission")
+              ;; Stands in for the command loop, which boundaries the
+              ;; undo list before running the undo command.
+              (undo-boundary)
+              (undo)
+              (list (cons :prompt-input (agent-shell--prompt-input))
+                    (cons :output-intact (and (string-match-p
+                                               "Some agent output" (buffer-string))
+                                              t)))))
+           '((:prompt-input . nil) (:output-intact . t)))))
 
 (ert-deftest agent-shell-file-display-action-test ()
   "Files open per `agent-shell-file-display-action\'.
@@ -9313,6 +9533,120 @@ tick after an off-screen one."
             (funcall handler nil 'ended)
             (should (= redraws 4))))
       (kill-buffer shell-buffer))))
+
+(defun agent-shell-tests--beat (status value)
+  "Set the shell's heartbeat to STATUS at VALUE, as a heartbeat tick does."
+  (setf (map-elt agent-shell--state :heartbeat)
+        (list (cons :status status) (cons :value value))))
+
+(defmacro agent-shell-tests--with-busy-prompt (&rest body)
+  "Run BODY in a non-chat shell buffer ending in a live `Claude> ' prompt."
+  (declare (indent 0))
+  `(with-temp-buffer
+     (setq-local agent-shell--state nil)
+     (agent-shell-tests--beat 'busy 1)
+     (insert "Claude> hello\n\nreply\n\n")
+     (let ((prompt-start (point-max)))
+       (insert "Claude> ")
+       (setq-local comint-last-prompt (cons (copy-marker prompt-start)
+                                            (copy-marker (point-max)))))
+     (let ((agent-shell-chat-mode nil)
+           (agent-shell-show-busy-indicator t)
+           (agent-shell-prompt-busy-frames '("|" "/" "-" "\\")))
+       ,@body)))
+
+(defun agent-shell-tests--busy-prompt ()
+  "Return the live prompt as drawn, busy frame included, unpropertized.
+
+For example, returns \"Claude|> \" while busy and \"Claude> \" when idle."
+  (let ((prompt (buffer-substring-no-properties (car comint-last-prompt)
+                                                (cdr comint-last-prompt))))
+    (if-let* ((overlay agent-shell--busy-prompt-overlay)
+              (offset (- (overlay-start overlay) (car comint-last-prompt))))
+        (concat (substring prompt 0 offset)
+                (substring-no-properties (overlay-get overlay 'before-string))
+                (substring prompt offset))
+      prompt)))
+
+(ert-deftest agent-shell--animate-busy-prompt-draws-frame-test ()
+  "A busy heartbeat draws its frame ahead of the live prompt's chevron.
+Removed once the heartbeat ends."
+  (agent-shell-tests--with-busy-prompt
+    (agent-shell--animate-busy-prompt)
+    (should (equal (agent-shell-tests--busy-prompt) "Claude/> "))
+    (agent-shell-tests--beat 'busy 2)
+    (agent-shell--animate-busy-prompt)
+    (should (equal (agent-shell-tests--busy-prompt) "Claude-> "))
+    (agent-shell-tests--beat 'ended nil)
+    (agent-shell--animate-busy-prompt)
+    (should (equal (agent-shell-tests--busy-prompt) "Claude> "))
+    (should-not agent-shell--busy-prompt-overlay)))
+
+(ert-deftest agent-shell--animate-busy-prompt-accepts-frame-shapes-test ()
+  "Busy prompt frames can be a list, vector, string or function."
+  (agent-shell-tests--with-busy-prompt
+    (dolist (case '((("a" "b") . "Claudeb> ")
+                    (["a" "b"] . "Claudeb> ")
+                    ("(busy)" . "Claude(busy)> ")))
+      (setq agent-shell-prompt-busy-frames (car case))
+      (agent-shell--animate-busy-prompt)
+      (should (equal (agent-shell-tests--busy-prompt) (cdr case))))
+    (setq agent-shell-prompt-busy-frames (lambda () "(connecting)"))
+    (agent-shell--animate-busy-prompt)
+    (should (equal (agent-shell-tests--busy-prompt) "Claude(connecting)> "))
+    (setq agent-shell-prompt-busy-frames (lambda () '("a" "b")))
+    (agent-shell--animate-busy-prompt)
+    (should (equal (agent-shell-tests--busy-prompt) "Claudeb> "))
+    (setq agent-shell-prompt-busy-frames #'ignore)
+    (agent-shell--animate-busy-prompt)
+    (should (equal (agent-shell-tests--busy-prompt) "Claude> "))))
+
+(ert-deftest agent-shell--animate-busy-prompt-skips-unchanged-frame-test ()
+  "A tick drawing the frame already shown leaves the overlay untouched.
+A static frame, ticked alongside an animated header, would otherwise
+rewrite the prompt on every beat."
+  (agent-shell-tests--with-busy-prompt
+    (setq agent-shell-prompt-busy-frames "(busy)")
+    (agent-shell--animate-busy-prompt)
+    (let ((drawn (overlay-get agent-shell--busy-prompt-overlay 'before-string)))
+      (agent-shell-tests--beat 'busy 2)
+      (agent-shell--animate-busy-prompt)
+      (should (eq (overlay-get agent-shell--busy-prompt-overlay 'before-string)
+                  drawn)))))
+
+(ert-deftest agent-shell--animate-busy-prompt-skips-chat-mode-test ()
+  "Chat mode animates its own marker, so no busy frame is drawn here."
+  (agent-shell-tests--with-busy-prompt
+    (agent-shell--animate-busy-prompt)
+    (should (equal (agent-shell-tests--busy-prompt) "Claude/> "))
+    (setq agent-shell-chat-mode t)
+    (agent-shell--animate-busy-prompt)
+    (should (equal (agent-shell-tests--busy-prompt) "Claude> "))))
+
+(ert-deftest agent-shell--busy-prompt-cleared-on-chat-enable-test ()
+  "Turning chat mode on mid-turn removes the busy frame already drawn.
+Chat mode's heartbeat ticks animate its own marker instead, so nothing
+else would remove it."
+  (agent-shell-tests--with-busy-prompt
+    (agent-shell--animate-busy-prompt)
+    (should (equal (agent-shell-tests--busy-prompt) "Claude/> "))
+    (cl-letf (((symbol-function 'agent-shell-subscribe-to) #'ignore)
+              ((symbol-function 'agent-shell-unsubscribe) #'ignore)
+              ((symbol-function 'agent-shell-chat--relabel) #'ignore))
+      (agent-shell-chat--enable)
+      (should (equal (agent-shell-tests--busy-prompt) "Claude> "))
+      (agent-shell-chat--disable))))
+
+(ert-deftest agent-shell--animate-busy-prompt-keeps-output-above-test ()
+  "Output inserted above the live prompt stays ahead of the busy frame."
+  (agent-shell-tests--with-busy-prompt
+    (agent-shell--animate-busy-prompt)
+    (agent-shell--with-buffer-narrowed-to (car comint-last-prompt)
+      (goto-char (point-max))
+      (insert "more reply\n"))
+    (should (equal (buffer-substring (car comint-last-prompt) (point-max))
+                   "Claude> "))
+    (should (equal (agent-shell-tests--busy-prompt) "Claude/> "))))
 
 ;; TODO: Remove after 2026-11-29, along with the check it tests.
 ;; Declared special so the test can bind the retired variable.

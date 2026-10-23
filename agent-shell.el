@@ -4,17 +4,17 @@
 
 ;; Author: Alvaro Ramirez https://xenodium.com
 ;; URL: https://github.com/xenodium/agent-shell
-;; Version: 0.87.10
-;; Package-Requires: ((emacs "29.1") (shell-maker "0.97.5") (acp "0.17.1"))
+;; Version: 0.89.1
+;; Package-Requires: ((emacs "29.1") (shell-maker "0.98.2") (acp "0.17.1"))
 
-(defconst agent-shell--version "0.87.10")
+(defconst agent-shell--version "0.89.1")
 
 ;; Minimum dependency versions, as declared in the `Package-Requires'
 ;; header above.  Package managers that resolve versions enforce the
 ;; header on install; those that only resolve dependency names (straight.el,
 ;; for one) leave `agent-shell--start' as the sole check, so keep these two
 ;; in sync with it.
-(defconst agent-shell--shell-maker-minimum-version "0.97.5")
+(defconst agent-shell--shell-maker-minimum-version "0.98.2")
 
 (defconst agent-shell--acp-minimum-version "0.17.1")
 
@@ -72,6 +72,7 @@
 (require 'agent-shell-completion)
 (require 'agent-shell-config)
 (require 'agent-shell-cursor)
+(require 'agent-shell-deepseek)
 (require 'agent-shell-devcontainer)
 (require 'agent-shell-diff)
 (require 'agent-shell-dnd)
@@ -456,7 +457,11 @@ bullet, while a body of prose is untouched."
                                (not (get-text-property
                                      (1- (point-max))
                                      'agent-shell-markdown-table-source))))))
-            (agent-shell--render-markdown :complete t)))))))
+            (agent-shell--render-markdown :complete t))))))
+  ;; Rendering can resize text above the prompt, shifting any unsubmitted
+  ;; input away from the undo entries recorded for it.
+  (when (agent-shell--live-input-prompt-p comint-last-prompt)
+    (agent-shell--reset-undo-history)))
 
 (defcustom agent-shell-confirm-interrupt t
   "Whether to prompt for confirmation before interrupting.
@@ -754,6 +759,7 @@ Each element can be:
                                               session-meta
                                               mcp-servers
                                               notification-adapter
+                                              notification-handler
                                               icon-name
                                               install-instructions)
   "Create an agent configuration alist.
@@ -787,7 +793,11 @@ Keyword arguments:
 - MCP-SERVERS: Optional list of MCP servers for this agent, taking
   precedence over the global `agent-shell-mcp-servers'.  Same shape as
   that variable.
-- NOTIFICATION-ADAPTER: Optional function to modify/normalize `notification'
+- NOTIFICATION-ADAPTER: Optional function called with `:acp-notification'.
+  Return the original or a normalized notification for further handling.
+- NOTIFICATION-HANDLER: Optional function called after adaptation with an
+  alist of `:state' and `:acp-notification'.  Return non-nil if handled,
+  skipping core handling, or nil to let core handle it.
 - ICON-NAME: Name of the icon to use
 - INSTALL-INSTRUCTIONS: Instructions to show when executable is not found
 
@@ -807,6 +817,7 @@ Returns an alist with all specified values."
     (:session-meta . ,session-meta)
     (:mcp-servers . ,mcp-servers)
     (:notification-adapter . ,notification-adapter)            ;; function
+    (:notification-handler . ,notification-handler)            ;; function
     (:icon-name . ,icon-name)
     (:install-instructions . ,install-instructions)))
 
@@ -828,6 +839,7 @@ example filtering them.  See `agent-shell-agent-configs'."
         #'agent-shell-cline-make-agent-config
         #'agent-shell-openai-make-codex-config
         #'agent-shell-cursor-make-agent-config
+        #'agent-shell-deepseek-make-agent-config
         #'agent-shell-droid-make-agent-config
         #'agent-shell-github-make-copilot-config
         #'agent-shell-google-make-gemini-config
@@ -919,6 +931,7 @@ behavior explicitly."
                  (const :tag "Codex" codex)
                  (const :tag "Copilot" copilot)
                  (const :tag "Cursor" cursor)
+                 (const :tag "DeepSeek" deepseek)
                  (const :tag "Droid" droid)
                  (const :tag "Gemini CLI" gemini-cli)
                  (const :tag "Goose" goose)
@@ -3114,6 +3127,15 @@ For example, ((file_path . \"a.el\")) returns \"a.el\"."
             (seq-map (lambda (key) (map-elt raw-input key))
                      '(filepath fileName path file_path))))
 
+(defun agent-shell--raw-input-command (acp-raw-input)
+  "Return the command display string in ACP-RAW-INPUT, or nil.
+For example, ((command_line . \"ls -la\")) returns \"ls -la\"."
+  ;; Antigravity sends `command_line' rather than `command'.
+  ;; See https://github.com/xenodium/agent-shell/issues/903
+  (agent-shell--tool-call-command-to-string
+   (or (map-elt acp-raw-input 'command)
+       (map-elt acp-raw-input 'command_line))))
+
 (defun agent-shell--tool-call-file-paths (tool-call)
   "Return file paths reported by TOOL-CALL, or nil if unavailable.
 For example, two diffs for \"a.el\" return (\"a.el\" \"a.el\")."
@@ -3435,8 +3457,8 @@ Clears STATE's `:expanded-activity-group'."
                                          (map-nested-elt acp-notification '(params update title)))))
                           (cons :status (map-nested-elt acp-notification '(params update status)))
                           (cons :kind (map-nested-elt acp-notification '(params update kind)))
-                          (cons :command (agent-shell--tool-call-command-to-string
-                                          (map-nested-elt acp-notification '(params update rawInput command))))
+                          (cons :command (agent-shell--raw-input-command
+                                          (map-nested-elt acp-notification '(params update rawInput))))
                           (cons :description (map-nested-elt acp-notification '(params update rawInput description)))
                           (cons :content (map-nested-elt acp-notification '(params update content)))
                           (cons :locations (map-nested-elt acp-notification '(params update locations)))
@@ -3637,8 +3659,8 @@ Clears STATE's `:expanded-activity-group'."
                     (when-let* ((description (agent-shell--tool-call-command-to-string
                                               (map-nested-elt acp-notification '(params update rawInput description)))))
                       (list (cons :description description)))
-                    (when-let* ((command (agent-shell--tool-call-command-to-string
-                                          (map-nested-elt acp-notification '(params update rawInput command)))))
+                    (when-let* ((command (agent-shell--raw-input-command
+                                          (map-nested-elt acp-notification '(params update rawInput)))))
                       (list (cons :command command)))
                     (when-let* ((raw-input (map-nested-elt acp-notification '(params update rawInput))))
                       (list (cons :raw-input raw-input)))
@@ -4868,6 +4890,21 @@ displayed in no window is measured against the selected frame instead.
         (truncate-string-to-width text (max available 1) nil nil "…")
       text)))
 
+(cl-defun agent-shell--propertize-tool-call-title (&key title kind)
+  "Return TITLE faced as `default', with a read's line range dimmed.
+
+KIND is the tool call kind.  When KIND is \"read\" and TITLE ends in a
+line range, the range is faced with `agent-shell-section-annotation'.
+
+For example, the \"(10 - 20)\" in \"file.el (10 - 20)\" is dimmed."
+  (let ((title (propertize title 'font-lock-face 'default)))
+    (when (and (equal kind "read")
+               (string-match "([0-9]+ *- *[0-9]+)\\s-*\\'" title))
+      (put-text-property (match-beginning 0) (match-end 0)
+                         'font-lock-face 'agent-shell-section-annotation
+                         title))
+    title))
+
 (defun agent-shell-make-tool-call-label (state tool-call-id)
   "Create tool call label from STATE using TOOL-CALL-ID.
 
@@ -4914,11 +4951,13 @@ Returns propertized labels in :status and :title propertized."
                               (not (equal (string-remove-prefix "`" (string-remove-suffix "`" (string-trim title)))
                                           (string-remove-prefix "`" (string-remove-suffix "`" (string-trim description))))))
                          (concat
-                          (propertize title 'font-lock-face 'default)
+                          (agent-shell--propertize-tool-call-title
+                           :title title :kind (map-elt tool-call :kind))
                           " "
                           (propertize description 'font-lock-face 'agent-shell-section-annotation)))
                         (title
-                         (propertize title 'font-lock-face 'default))
+                         (agent-shell--propertize-tool-call-title
+                          :title title :kind (map-elt tool-call :kind)))
                         (description
                          (propertize description 'font-lock-face 'default)))))
       `((:status . ,status)
@@ -5367,7 +5406,12 @@ variable (see makunbound)"))
                  (equal (current-buffer)
                         (map-elt state :buffer)))
       (error "Editing the wrong buffer: %s" (current-buffer)))
-    (agent-shell-ui-delete-fragment :namespace-id (map-elt state :request-count) :block-id block-id :no-undo t)))
+    (let ((input-start (agent-shell--prompt-input-start)))
+      (agent-shell-ui-delete-fragment :namespace-id (map-elt state :request-count) :block-id block-id :no-undo t)
+      ;; A deletion above the prompt pulled any unsubmitted input up, so the
+      ;; undo entries recorded for it point at the shifted text.
+      (unless (equal input-start (agent-shell--prompt-input-start))
+        (agent-shell--reset-undo-history)))))
 
 (cl-defun agent-shell--collapse-fragment-group (&key state namespace-id block-id)
   "Collapse group header BLOCK-ID under NAMESPACE-ID in STATE's buffers.
@@ -8269,6 +8313,7 @@ pending-restore state once replay completes."
                 ;; A replay renders history the user never typed, so keep all of
                 ;; it out of undo history (see `agent-shell--reset-undo-history').
                 (let ((buffer-undo-list t)
+                      (shell-maker-inhibit-auto-scroll t)
                       (prompt-start (and comint-last-prompt
                                          (marker-position (car comint-last-prompt))
                                          (agent-shell--live-input-prompt-p comint-last-prompt)
@@ -8754,13 +8799,18 @@ The agent config's `:mcp-servers' take precedence over the global
   (acp-subscribe-to-notifications
    :client (map-elt state :client)
    :on-notification (lambda (acp-notification)
-                      (agent-shell--on-notification
-                       :state state
-                       :acp-notification
-                       (agent-shell--adapt-notification
-                        :state state
-                        :acp-notification acp-notification)
-                       )))
+                      (let ((adapted-notification
+                             (agent-shell--adapt-notification
+                              :state state
+                              :acp-notification acp-notification)))
+                        (if-let* ((handler (map-nested-elt state '(:agent-config :notification-handler)))
+                                  ((functionp handler))
+                                  ((funcall handler `((:state . ,state)
+                                                      (:acp-notification . ,adapted-notification)))))
+                            (map-put! state :last-activity-time (current-time))
+                          (agent-shell--on-notification
+                           :state state
+                           :acp-notification adapted-notification)))))
   (acp-subscribe-to-requests
    :client (map-elt state :client)
    :on-request (lambda (acp-request)
@@ -9882,8 +9932,7 @@ For example:
   => \"```console\\nls -la\\n```\""
   (let* ((title (map-elt tool-call :title))
          (raw-input (map-elt tool-call :raw-input))
-         (command (agent-shell--tool-call-command-to-string
-                   (map-elt raw-input 'command)))
+         (command (agent-shell--raw-input-command raw-input))
          (filepath (agent-shell--raw-input-file-path raw-input))
          ;; Fetch tools (eg. OpenCode's webfetch) put the target URL
          ;; under `url'.  Surface it in full below, since the basename
@@ -11058,9 +11107,9 @@ tick, its first busy tick and its ending tick, and on none in between."
     (lambda (_heartbeat status)
       (when-let* (((buffer-live-p shell-buffer))
                   (frames (with-current-buffer shell-buffer
-                            (cons (agent-shell--busy-indicator-frame)
-                                  (and agent-shell-chat-mode
-                                       (agent-shell-chat--busy-frame))))))
+                            (list (agent-shell--busy-indicator-frame)
+                                  (agent-shell-chat--busy-frame)
+                                  agent-shell-chat-mode))))
         ;; 'ended is the final tick; render even if off-screen to
         ;; ensure animation is hidden.  Frames go unrecorded while
         ;; off-screen, so the next visible tick redraws.
@@ -11072,8 +11121,9 @@ tick, its first busy tick and its ending tick, and on none in between."
               (with-current-buffer shell-buffer
                 (agent-shell--update-header-and-mode-line
                  :cache-enabled (eq status 'busy))
-                (when agent-shell-chat-mode
-                  (agent-shell-chat--animate-live-marker))))
+                (if agent-shell-chat-mode
+                    (agent-shell-chat--animate-live-marker)
+                  (agent-shell--animate-busy-prompt))))
           (setq shell-frames nil))
         (when-let* ((viewport-buffer (agent-shell-viewport--buffer
                                       :shell-buffer shell-buffer

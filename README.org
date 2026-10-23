@@ -31,6 +31,7 @@ Works with 23 agents today, and any other that speaks ACP:
 - [[https://docs.github.com/en/copilot/reference/copilot-cli-reference/acp-server][GitHub Copilot]]
 - [[https://www.kimi.com/code][Kimi Code CLI]]
 - [[https://www.codebuddy.ai][CodeBuddy]]
+- [[https://github.com/deepseek-ai/deepseek-harness][DeepSeek Harness]]
 - [[https://kiro.dev][Kiro CLI]]
 - [[https://qoder.com][Qoder CLI]]
 - [[https://github.com/QwenLM/qwen-code][Qwen Code]]
@@ -196,6 +197,33 @@ codebuddy --acp
 #+end_src
 
 See https://www.codebuddy.ai/docs/zh/ide/Getting-Started/Installation for details.
+
+*** DeepSeek Harness
+
+For DeepSeek Harness, install with:
+
+#+begin_src bash
+npm install -g @deepseek-ai/dsh
+#+end_src
+
+The ACP server reads your API key from =DEEPSEEK_API_KEY=.  If Emacs
+does not inherit it from your shell, set it via
+=agent-shell-deepseek-authentication=:
+
+#+begin_src emacs-lisp
+(setq agent-shell-deepseek-authentication
+      (agent-shell-deepseek-make-authentication :api-key "your-key"))
+#+end_src
+
+agent-shell launches =dsh --profile acp=, which keeps its own settings
+separate from other dsh profiles.  If models configured elsewhere (for
+example, via the dsh web UI) are missing, copy them over:
+
+#+begin_src bash
+cp -i ~/.dsh/profiles/web/cordis.patch.yml ~/.dsh/profiles/acp/cordis.patch.yml
+#+end_src
+
+See https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/acp/acp/README.md for details.
 
 *** Junie
 
@@ -779,6 +807,23 @@ Huge thanks for /gdindi/ for finding and and describing this in https://github.c
 
 By default, =agent-shell= includes configurations for all supported agents (Claude Agent, Gemini CLI, Codex, Goose, Grok Build, Cursor, CodeBuddy, Qwen Code, and Auggie). You can customize which agents are available through the =agent-shell-agent-configs= variable.
 
+*** Handling provider notifications
+
+Provider implementations can set =:notification-handler= in =agent-shell-make-agent-config= to handle custom ACP notifications. The callback runs after =:notification-adapter= and receives an event alist containing =:state= and the adapted =:acp-notification=. Return non-nil when handled, or nil to continue with core notification handling.
+
+#+begin_src emacs-lisp
+  (agent-shell-make-agent-config
+   :identifier 'example
+   :notification-handler
+   (lambda (event)
+     (when (equal (map-nested-elt event '(:acp-notification method))
+                  "_example/status")
+       (message "%s" (map-nested-elt event '(:acp-notification params text)))
+       t)))
+#+end_src
+
+Return nil for standard notifications such as =session/update= so core keeps rendering them. See =C-h f agent-shell-make-agent-config= for the configuration options.
+
 ** Usage
 
 *** Quick Start
@@ -848,6 +893,7 @@ Start a specific agent shell session directly:
 - =M-x agent-shell-goose-start-agent= - Start a Goose agent session
 - =M-x agent-shell-xai-start-grok= - Start a Grok Build (xAI) agent session
 - =M-x agent-shell-cursor-start-agent= - Start a Cursor agent session
+- =M-x agent-shell-deepseek-start-agent= - Start a DeepSeek Harness agent session
 - =M-x agent-shell-junie-start-agent= - Start a Junie agent session
 - =M-x agent-shell-kiro-start-agent= - Start a Kiro CLI agent session
 - =M-x agent-shell-qoder-start-agent= - Start a Qoder CLI agent session
@@ -1144,6 +1190,10 @@ always go to Evil modes if you need to with ~C-z~).
 | agent-shell-cursor-authentication             | Configuration for Cursor authentication.                                        |
 | agent-shell-cursor-environment                | Environment variables for the Cursor agent client.                              |
 | agent-shell-cwd-function                      | When non-nil, a function called to determine the shell’s CWD.                   |
+| agent-shell-deepseek-acp-command              | Command and parameters for the DeepSeek Harness ACP server.                     |
+| agent-shell-deepseek-authentication           | Configuration for DeepSeek Harness authentication.                              |
+| agent-shell-deepseek-default-config-options   | Default DeepSeek Harness config options, applied at session start.              |
+| agent-shell-deepseek-environment              | Environment variables for the DeepSeek Harness ACP server.                      |
 | agent-shell-display-action                    | Display action for agent shell buffers.                                         |
 | agent-shell-dot-subdir-function               | Function used by ‘agent-shell--dot-subdir’ to resolve subdirectory paths.       |
 | agent-shell-droid-acp-command                 | Command and parameters for the Factory Droid ACP client.                        |
@@ -1314,6 +1364,7 @@ always go to Evil modes if you need to with ~C-z~).
 |                                                       | agent-shell-copy-source-block-at-point                  | Copy the rendered fenced code block body at POS (or point) to the kill ring.  |
 |                                                       | agent-shell-cursor-start-agent                          | Start an interactive Cursor agent shell.                                      |
 | C-<tab>                                               | agent-shell-cycle-session-mode                          | Cycle through available session modes for the current `agent-shell' session.  |
+|                                                       | agent-shell-deepseek-start-agent                        | Start an interactive DeepSeek Harness agent shell.                            |
 |                                                       | agent-shell-delete-interaction-at-point                 | Delete interaction (request and response) at point.                           |
 |                                                       | agent-shell-diff-accept-all                             | Accept all changes in the current diff buffer.                                |
 |                                                       | agent-shell-diff-mode                                   | Major mode for `agent-shell' diff buffers.                                    |

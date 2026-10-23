@@ -202,7 +202,7 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                  ;; it still describes the buffer.
                  (cached (unless create-new
                            (agent-shell-ui--cached-block qualified-id)))
-                 (match (unless cached
+                 (match (unless (or cached create-new)
                           (save-mark-and-excursion
                             (goto-char (point-max))
                             (text-property-search-backward
@@ -1224,13 +1224,14 @@ When NO-UNDO is non-nil, disable undo recording."
            (props `(agent-shell-ui-state ((:qualified-id . ,qualified-id))
                                          read-only t
                                          front-sticky (read-only)))
-           (match (save-mark-and-excursion
-                    (goto-char (point-max))
-                    (text-property-search-backward
-                     'agent-shell-ui-state nil
-                     (lambda (_ state)
-                       (equal (map-elt state :qualified-id) qualified-id))
-                     t))))
+           (match (unless create-new
+                    (save-mark-and-excursion
+                      (goto-char (point-max))
+                      (text-property-search-backward
+                       'agent-shell-ui-state nil
+                       (lambda (_ state)
+                         (equal (map-elt state :qualified-id) qualified-id))
+                       t)))))
       (when text
         (cond
          ;; Append to existing entry.
