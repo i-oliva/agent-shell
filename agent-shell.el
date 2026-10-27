@@ -11049,12 +11049,13 @@ See https://agentclientprotocol.com/protocol/session-modes for details."
 Returns the model name if available, otherwise returns nil.
 Prefers config option data when available."
   (let ((model-id (agent-shell--current-model-id state)))
-    (or (map-elt (seq-find (lambda (model)
-                             (string= (map-elt model :model-id)
-                                      model-id))
-                           (agent-shell--get-available-models state))
-                 :name)
-        model-id)))
+    (if-let* ((option (agent-shell--config-option-by-category state "model")))
+        (agent-shell--config-option-value-name option model-id)
+      (or (map-elt (seq-find (lambda (model)
+                               (string= (map-elt model :model-id) model-id))
+                             (agent-shell--get-available-models state))
+                   :name)
+          model-id))))
 
 (defun agent-shell-get-mode-name (state)
   "Get the current session mode name from STATE.
@@ -11214,6 +11215,33 @@ mode) into submenus."
                   `(menu-item "LLM model" ,(agent-shell--mode-line-model-menu))))
     menu))
 
+(cl-defun agent-shell--mode-line-menu-link (text &key face name command menu)
+  "Return TEXT as a mode-line link to MENU, styled with FACE.
+
+Resolve COMMAND's shortcut on hover and build MENU on click, both in
+the originating shell.  NAME labels the tooltip: for example, \"LLM model\"
+produces \"Open LLM model menu C-c C-v\" when COMMAND is bound to C-c C-v."
+  (let ((shell-buffer (current-buffer))
+        (map (make-sparse-keymap)))
+    (define-key map [mode-line mouse-1]
+                (list 'menu-item "" nil :filter
+                      (lambda (_)
+                        (when (buffer-live-p shell-buffer)
+                          (with-current-buffer shell-buffer
+                            (funcall menu))))))
+    (propertize text
+                'face face
+                'mouse-face 'mode-line-highlight
+                'local-map map
+                'help-echo
+                (lambda (_window _object _position)
+                  (when (buffer-live-p shell-buffer)
+                    (with-current-buffer shell-buffer
+                      (concat "Open " name " menu "
+                              (propertize (key-description
+                                           (where-is-internal command agent-shell-mode-map t))
+                                          'face 'agent-shell-key-binding))))))))
+
 (defun agent-shell--mode-line-format ()
   "Return `agent-shell''s mode-line format.
 
@@ -11228,52 +11256,24 @@ Shows \" ⧉\" when a command prefix is used."
               (propertize " ⧉ ➤"
                           'face 'agent-shell-container-indicator
                           'help-echo "Running in container"))
-            (when-let* ((model-name (or (map-elt (seq-find (lambda (model)
-                                                             (string= (map-elt model :model-id)
-                                                                      (agent-shell--current-model-id (agent-shell--state))))
-                                                           (agent-shell--get-available-models (agent-shell--state)))
-                                                 :name)
-                                        (agent-shell--current-model-id (agent-shell--state)))))
-              (concat " " (propertize model-name
-                                      'face 'agent-shell-model
-                                      'help-echo (concat "Open LLM model menu "
-                                                         (propertize (key-description (where-is-internal
-                                                                                       'agent-shell-set-session-model
-                                                                                       agent-shell-mode-map t))
-                                                                     'face 'agent-shell-key-binding))
-                                      'mouse-face 'mode-line-highlight
-                                      'local-map (let ((map (make-sparse-keymap)))
-                                                   (define-key map [mode-line mouse-1]
-                                                               (agent-shell--mode-line-model-menu))
-                                                   map))))
+            (when-let* ((model-name (agent-shell-get-model-name (agent-shell--state))))
+              (concat " " (agent-shell--mode-line-menu-link
+                           model-name :face 'agent-shell-model :name "LLM model"
+                           :command 'agent-shell-set-session-model
+                           :menu #'agent-shell--mode-line-model-menu)))
             (when-let* ((thought-level-name (agent-shell-get-thought-level-name (agent-shell--state))))
-              (concat " ➤ " (propertize thought-level-name
-                                        'face 'agent-shell-thought-level
-                                        'help-echo (concat "Open thought level menu "
-                                                           (propertize (key-description (where-is-internal
-                                                                                         'agent-shell-set-session-thought-level
-                                                                                         agent-shell-mode-map t))
-                                                                       'face 'agent-shell-key-binding))
-                                        'mouse-face 'mode-line-highlight
-                                        'local-map (let ((map (make-sparse-keymap)))
-                                                     (define-key map [mode-line mouse-1]
-                                                                 (agent-shell--mode-line-thought-level-menu))
-                                                     map))))
+              (concat " ➤ " (agent-shell--mode-line-menu-link
+                             thought-level-name :face 'agent-shell-thought-level
+                             :name "thought level"
+                             :command 'agent-shell-set-session-thought-level
+                             :menu #'agent-shell--mode-line-thought-level-menu)))
             (when-let* ((mode-name (agent-shell--resolve-session-mode-name
                                     (agent-shell--current-mode-id (agent-shell--state))
                                     (agent-shell--get-available-modes (agent-shell--state)))))
-              (concat " ➤ " (propertize mode-name
-                                        'face 'agent-shell-session-mode
-                                        'help-echo (concat "Open session mode menu "
-                                                           (propertize (key-description (where-is-internal
-                                                                                         'agent-shell-set-session-mode
-                                                                                         agent-shell-mode-map t))
-                                                                       'face 'agent-shell-key-binding))
-                                        'mouse-face 'mode-line-highlight
-                                        'local-map (let ((map (make-sparse-keymap)))
-                                                     (define-key map [mode-line mouse-1]
-                                                                 (agent-shell--mode-line-mode-menu))
-                                                     map))))
+              (concat " ➤ " (agent-shell--mode-line-menu-link
+                             mode-name :face 'agent-shell-session-mode :name "session mode"
+                             :command 'agent-shell-set-session-mode
+                             :menu #'agent-shell--mode-line-mode-menu)))
             (when-let* ((indicator (agent-shell--context-usage-indicator)))
               (concat " ➤ " indicator))
             (agent-shell--busy-indicator-frame))))
