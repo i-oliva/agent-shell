@@ -144,63 +144,79 @@ Returns an alist with insertion details or nil otherwise:
               (text (or append (agent-shell--context :shell-buffer shell-buffer) "")))
     (when (and override (not (string-empty-p text)))
       (error "Cannot override"))
-    (let ((insert-start nil)
-          (insert-end nil))
-      (agent-shell--display-buffer viewport-buffer)
-      (when (and override
-                 (with-current-buffer viewport-buffer
+    (let ((frame (selected-frame))
+          (insert-start nil)
+          (insert-end nil)
+          (location nil))
+      ;; Populate before displaying, so display actions sizing the window
+      ;; to its buffer (e.g. `fit-window-to-buffer') see the content.
+      (with-current-buffer viewport-buffer
+        (when (and override
                    ;; Only guard an in-progress compose draft.
-                   (and (derived-mode-p 'agent-shell-viewport-edit-mode)
-                        (not (= (buffer-size) 0)))))
-        (unless (y-or-n-p "Compose buffer is not empty.  Override?")
-          ;; User does not want to override.
-          ;; Treat as regular text (typically appended).
-          (setq text (concat text
-                             (unless (string-empty-p text)
-                               "\n\n")
-                             override))
-          (setq override nil)))
-      ;; TODO: Do we need to get prompt and partial response,
-      ;; in case viewport compose buffer is created for the
-      ;; first time on an ongoing/busy shell session?
-      (cond
-       ;; Busy with no text/override to drop in -> stay in view mode.
-       ;; When text/override is present, or EDIT is requested, fall through
-       ;; to edit mode so the user can compose; `compose-send-*' will queue
-       ;; on submit.
-       ((and (not edit)
-             (agent-shell-viewport--busy-p)
-             (string-empty-p (string-trim text))
-             (or (not override) (string-empty-p (string-trim override))))
-        (agent-shell-viewport-view-mode))
-       (override
-        (agent-shell-viewport-edit-mode)
-        (agent-shell-viewport--initialize)
-        (setq insert-start (point))
-        (insert override)
-        (setq insert-end (point)))
-       ((derived-mode-p 'agent-shell-viewport-edit-mode)
-        (unless (string-empty-p text)
+                   (derived-mode-p 'agent-shell-viewport-edit-mode)
+                   (not (= (buffer-size) 0)))
+          ;; Show the draft the user is asked about.
+          (agent-shell--display-buffer viewport-buffer)
+          (unless (y-or-n-p "Compose buffer is not empty.  Override?")
+            ;; User does not want to override.
+            ;; Treat as regular text (typically appended).
+            (setq text (concat text
+                               (unless (string-empty-p text)
+                                 "\n\n")
+                               override))
+            (setq override nil)))
+        ;; TODO: Do we need to get prompt and partial response,
+        ;; in case viewport compose buffer is created for the
+        ;; first time on an ongoing/busy shell session?
+        (cond
+         ;; Busy with no text/override to drop in -> stay in view mode.
+         ;; When text/override is present, or EDIT is requested, fall through
+         ;; to edit mode so the user can compose; `compose-send-*' will queue
+         ;; on submit.
+         ((and (not edit)
+               (agent-shell-viewport--busy-p)
+               (string-empty-p (string-trim text))
+               (or (not override) (string-empty-p (string-trim override))))
+          (agent-shell-viewport-view-mode))
+         (override
+          (agent-shell-viewport-edit-mode)
+          (agent-shell-viewport--initialize)
+          (setq insert-start (point))
+          (insert override)
+          (setq insert-end (point))
+          (setq location (point)))
+         ((derived-mode-p 'agent-shell-viewport-edit-mode)
+          (unless (string-empty-p text)
+            (save-excursion
+              (goto-char (point-max))
+              (setq insert-start (point))
+              (insert "\n\n" text)
+              (setq insert-end (point)))))
+         (t
+          (agent-shell-viewport-edit-mode)
+          ;; Transitioned to edit mode. Wipe content.
+          (agent-shell-viewport--initialize)
+          ;; Restore snapshot if needed.
+          (when-let* ((snapshot agent-shell-viewport--compose-snapshot))
+            (insert (map-elt snapshot :content))
+            (goto-char (map-elt snapshot :location))
+            (setq agent-shell-viewport--compose-snapshot nil))
           (save-excursion
             (goto-char (point-max))
             (setq insert-start (point))
-            (insert "\n\n" text)
-            (setq insert-end (point)))))
-       (t
-        (agent-shell-viewport-edit-mode)
-        ;; Transitioned to edit mode. Wipe content.
-        (agent-shell-viewport--initialize)
-        ;; Restore snapshot if needed.
-        (when-let* ((snapshot agent-shell-viewport--compose-snapshot))
-          (insert (map-elt snapshot :content))
-          (goto-char (map-elt snapshot :location))
-          (setq agent-shell-viewport--compose-snapshot nil))
-        (save-excursion
-          (goto-char (point-max))
-          (setq insert-start (point))
-          (unless (string-empty-p text)
-            (insert "\n\n" text))
-          (setq insert-end (point)))))
+            (unless (string-empty-p text)
+              (insert "\n\n" text))
+            (setq insert-end (point)))
+          (setq location (point)))))
+      (agent-shell--display-buffer viewport-buffer)
+      ;; A window already showing the buffer keeps its own point, which
+      ;; the content wipe above moved to the start.
+      (when location
+        (goto-char location))
+      ;; The header renders at the selected frame's width, which changes
+      ;; when the viewport is displayed in another frame.
+      (unless (eq frame (selected-frame))
+        (agent-shell-viewport--update-header))
       `((:buffer . ,viewport-buffer)
         (:start . ,insert-start)
         (:end . ,insert-end)))))
@@ -661,8 +677,8 @@ in, landing on the item after it rather than on its next cell."
   ;; Leaving the table point is in — navigate on from its end, where its
   ;; own cells and their links are behind the search.
   (when-let* ((leave-table)
-              (table (agent-shell-markdown-table--region-at-point)))
-    (goto-char (cdr table)))
+              (table (agent-shell-markdown-table-at (point))))
+    (goto-char (map-elt table :end)))
   (let* ((current-pos (point))
          (prompt-start (agent-shell-viewport--prompt-start))
          (response-start (agent-shell-viewport--response-start))
@@ -730,8 +746,8 @@ in, as `agent-shell-viewport-next-item' does from its end."
   ;; Leaving the table point is in — navigate on from its start, where
   ;; its own cells and their links are behind the search.
   (when-let* ((leave-table)
-              (table (agent-shell-markdown-table--region-at-point)))
-    (goto-char (car table)))
+              (table (agent-shell-markdown-table-at (point))))
+    (goto-char (map-elt table :start)))
   (let* ((current-pos (point))
          (prompt-start (agent-shell-viewport--prompt-start))
          (response-start (agent-shell-viewport--response-start))
@@ -1698,6 +1714,7 @@ For example, offer to kill associated shell session."
   (setq-local filter-buffer-substring-function #'agent-shell--filter-buffer-substring)
   (setq-local beginning-of-defun-function #'agent-shell--beginning-of-block)
   (setq-local end-of-defun-function #'agent-shell--end-of-block)
+  (add-hook 'xref-backend-functions #'agent-shell-markdown-xref-backend nil t)
   (setq buffer-read-only t)
   (add-hook 'kill-buffer-hook #'agent-shell-viewport--clean-up nil t))
 

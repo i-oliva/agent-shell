@@ -905,6 +905,37 @@ block -- covering the dispatch path, not just the helper in isolation."
         (should-not (map-elt state :stream-render-pending))
         (should-not (map-elt state :stream-render-timer))))))
 
+(ert-deftest agent-shell--stream-render-flushes-on-session-push-end-test ()
+  "A pushed turn's pending text renders before the next turn starts.
+
+`session_push_end' finishes the turn and dispatches any queued prompt,
+which bumps `:request-count'.  A batch left pending until then would
+render under the queued prompt's namespace, after its text."
+  (with-temp-buffer
+    (let ((agent-shell--stream-render-interval 30)
+          (state (agent-shell--make-state :buffer (current-buffer)))
+          (rendered nil))
+      (map-put! state :request-count 1)
+      (cl-letf (((symbol-function 'agent-shell--update-fragment)
+                 (lambda (&rest _)
+                   (push (map-elt state :request-count) rendered)))
+                ((symbol-function 'agent-shell-experimental--on-session-push-end)
+                 (lambda (&rest _)
+                   (should rendered)
+                   ;; Stand in for the queued prompt `on-finished' dispatches.
+                   (map-put! state :request-count 2))))
+        (agent-shell--update-streamed-fragment
+         :state state :block-id "a" :body "pushed answer")
+        (agent-shell--on-notification
+         :state state
+         :acp-notification '((method . "session/update")
+                             (params
+                              (update
+                               (sessionUpdate . "session_push_end")))))
+        (should (equal rendered '(1)))
+        (should-not (map-elt state :stream-render-pending))
+        (should-not (map-elt state :stream-render-timer))))))
+
 (ert-deftest agent-shell--on-notification-session-info-update-test ()
   "Test `session_info_update' updates the session title.
 
@@ -1050,6 +1081,35 @@ highlighting."
         (with-current-buffer (find-buffer-visiting temp-file)
           (set-buffer-modified-p nil)))
       (ignore-errors (delete-file temp-file)))))
+
+(ert-deftest agent-shell--get-region-context-labels-line-numbers ()
+  "Region context label lists a single line once and a range otherwise.
+
+For example, \"region.el:2\" for a single-line region and
+\"region.el:1-3\" for a multi-line one."
+  (let ((project-dir (file-name-as-directory
+                      (make-temp-file "agent-shell-region" t))))
+    (unwind-protect
+        (with-temp-buffer
+          (insert "one\ntwo\nthree\n")
+          (setq buffer-file-name (expand-file-name "region.el" project-dir))
+          (set-buffer-modified-p nil)
+          (goto-char (point-min))
+          (forward-line 1)
+          (set-mark (point))
+          (end-of-line)
+          (activate-mark)
+          (should (string-prefix-p "region.el:2\n"
+                                   (agent-shell--get-region-context
+                                    :agent-cwd project-dir)))
+          (set-mark (point-min))
+          (goto-char (point-max))
+          (activate-mark)
+          (should (string-prefix-p "region.el:1-3\n"
+                                   (agent-shell--get-region-context
+                                    :agent-cwd project-dir)))
+          (setq buffer-file-name nil))
+      (delete-directory project-dir t))))
 
 (ert-deftest agent-shell--get-numbered-region-preserves-source-faces-only ()
   "Numbered region preview must keep faces but not source control properties.
@@ -1568,6 +1628,36 @@ straight to the shell."
                                                 (after . "Test")))))
                  '(((:old . "") (:new . "Test") (:file . "/tmp/test.txt"))))))
 
+(ert-deftest agent-shell--make-diff-infos-multi-hunk-test ()
+  "Test a multi-hunk rawInput diff yields one diff info per hunk.
+Based on Copilot traffic from
+https://github.com/xenodium/agent-shell/issues/931."
+  (should (equal (agent-shell--make-diff-infos
+                  :acp-tool-call
+                  '((rawInput . ((fileName . "/home/ivan/code/flakes/flake.nix")
+                                 (diff . "diff --git a/flake.nix b/flake.nix
+index 0000000..0000000 100644
+--- a/flake.nix
++++ b/flake.nix
+@@ -29,4 +29,3 @@
+     };
+\s
+-    plasma-manager = {};
+     emacs-overlay = {
+@@ -179,3 +171,2 @@
+               sharedNixSettings
+-              inputs.plasma-manager.homeModules.plasma-manager
+               ./hosts/home.nix
+")))))
+                 '(((:old . "    };\n\n    plasma-manager = {};\n    emacs-overlay = {\n")
+                    (:new . "    };\n\n    emacs-overlay = {\n")
+                    (:file . "/home/ivan/code/flakes/flake.nix")
+                    (:line . 29))
+                   ((:old . "              sharedNixSettings\n              inputs.plasma-manager.homeModules.plasma-manager\n              ./hosts/home.nix\n")
+                    (:new . "              sharedNixSettings\n              ./hosts/home.nix\n")
+                    (:file . "/home/ivan/code/flakes/flake.nix")
+                    (:line . 179))))))
+
 (ert-deftest agent-shell--diffs-line-stats-test ()
   "Test `agent-shell--diffs-line-stats' aggregates across diffs."
   ;; Test nil input
@@ -1856,6 +1946,84 @@ the category, the option is still returned."
          (state (list (cons :config-options options))))
     (should (equal (map-elt (agent-shell--config-option-by-category state "model") :id)
                    "model_id"))))
+
+(defun agent-shell-tests--more-config-options-state ()
+  "Return a state advertising model, provider, effort, speed and mode options."
+  (list (cons :config-options
+              (agent-shell--normalize-config-options
+               [((id . "provider") (name . "Provider") (category . "model")
+                 (type . "select") (currentValue . "cline")
+                 (options . [((value . "cline") (name . "Cline"))]))
+                ((id . "model") (name . "Model") (category . "model")
+                 (type . "select") (currentValue . "gpt-5.5")
+                 (options . [((value . "gpt-5.5") (name . "GPT-5.5"))]))
+                ((id . "reasoning_effort") (name . "Effort") (category . "thought_level")
+                 (type . "select") (currentValue . "low")
+                 (options . [((value . "low") (name . "Low"))]))
+                ((id . "fast-mode") (name . "Speed") (category . "model_config")
+                 (type . "select") (currentValue . "ultrafast")
+                 (options . [((value . "off") (name . "Standard"))
+                             ((value . "ultrafast") (name . "Ultrafast"))]))
+                ((id . "approval") (name . "Approval") (category . "mode")
+                 (type . "select") (currentValue . "auto")
+                 (options . [((value . "auto") (name . "Auto"))]))
+                ((id . "verbose") (name . "Verbose") (type . "boolean")
+                 (currentValue . t))]))))
+
+(ert-deftest agent-shell--more-config-options-test ()
+  "Test `agent-shell--more-config-options' skips options with a header segment.
+
+Model, thought level and mode already have their own segment.  The
+provider shares the model category but has none, so it is kept.
+Non-select options are never offered."
+  (should (equal (mapcar (lambda (option)
+                           (map-elt option :id))
+                         (agent-shell--more-config-options
+                          (agent-shell-tests--more-config-options-state)))
+                 '("provider" "fast-mode"))))
+
+(ert-deftest agent-shell--mode-line-more-menu-test ()
+  "Test the more options menu labels options with their current value and sets them."
+  (let ((state (agent-shell-tests--more-config-options-state))
+        (request nil))
+    (with-temp-buffer
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () state))
+                ((symbol-function 'agent-shell--shell-buffer) #'current-buffer)
+                ((symbol-function 'agent-shell--set-session-config-option)
+                 (lambda (&rest args) (setq request args))))
+        (let* ((menu (agent-shell--mode-line-more-menu))
+               (speed (lookup-key menu [config-fast-mode])))
+          (should (equal (keymap-prompt menu) "More"))
+          (should (equal (nth 2 (assq 'config-fast-mode (cdr menu)))
+                         "Speed (Ultrafast)"))
+          (should (equal (mapcar #'car (seq-filter #'consp (cdr speed)))
+                         '(value-off value-ultrafast)))
+          (funcall (nth 3 (assq 'value-off (cdr speed))))
+          (should (equal request '(:config-id "fast-mode" :value "off"))))))))
+
+(ert-deftest agent-shell--mode-line-combined-menu-includes-more-test ()
+  "Test the graphical header menu appends the more options after mode."
+  (let ((state (agent-shell-tests--more-config-options-state)))
+    (with-temp-buffer
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () state))
+                ((symbol-function 'agent-shell--shell-buffer) #'current-buffer))
+        (should (equal (mapcar #'car (seq-filter #'consp (cdr (agent-shell--mode-line-combined-menu))))
+                       '(model thought-level mode config-provider config-fast-mode)))))))
+
+(ert-deftest agent-shell--render-header-model-more-segment-test ()
+  "Test the text header counts more options after mode, only when there are any."
+  (let ((agent-shell-header-style 'text)
+        (header-model '((:buffer-name . "Codex")
+                        (:mode-name . "Auto")
+                        (:project-name . "project"))))
+    (cl-letf (((symbol-function 'agent-shell--mode-line-mode-menu) #'make-sparse-keymap)
+              ((symbol-function 'agent-shell--mode-line-more-menu) #'make-sparse-keymap))
+      (should-not (string-match-p "(\\+"
+                                  (agent-shell--render-header-model-uncached header-model)))
+      (should (string-match-p "Auto (\\+2) ➤ project"
+                              (agent-shell--render-header-model-uncached
+                               (cons '(:more-config-option-count . 2)
+                                     header-model)))))))
 
 (ert-deftest agent-shell--shell-response-start-ignores-quoted-marker-test ()
   "The response starts at shell-maker's own delimiter, not at a quoted one.
@@ -2290,6 +2458,56 @@ fast: requesting on... done"))
                              (configOptions . ,config-options))))))
     (should (equal (map-elt (car (map-elt state :config-options)) :current-value)
                    "code"))))
+
+(ert-deftest agent-shell--usage-update-emits-event-test ()
+  "Test usage_update emits `usage-update' with :usage and raw :meta."
+  (let ((state (list (cons :usage (list (cons :context-used 0)
+                                        (cons :context-size 0)))
+                     (cons :last-activity-time nil)))
+        (emitted nil))
+    (cl-letf (((symbol-function 'agent-shell--update-header-and-mode-line)
+               #'ignore)
+              ((symbol-function 'agent-shell--emit-event)
+               (lambda (&rest args)
+                 (push args emitted))))
+      (agent-shell--on-notification
+       :state state
+       :acp-notification '((method . "session/update")
+                           (params
+                            (update
+                             (sessionUpdate . "usage_update")
+                             (used . 1000)
+                             (size . 200000)
+                             (_meta (_claude/rateLimit (status . "allowed"))))))))
+    (should (equal (plist-get (car emitted) :event) 'usage-update))
+    (should (equal (map-nested-elt (plist-get (car emitted) :data) '(:usage :context-used))
+                   1000))
+    (should (equal (map-elt (plist-get (car emitted) :data) :meta)
+                   '((_claude/rateLimit (status . "allowed")))))))
+
+(ert-deftest agent-shell--config-option-update-emits-meta-test ()
+  "Test config_option_update passes the notification's `_meta' as :meta."
+  (let ((state (list (cons :session (list (cons :id "session-1")
+                                          (cons :config-options nil)))
+                     (cons :config-options nil)
+                     (cons :last-activity-time nil)))
+        (emitted nil))
+    (cl-letf (((symbol-function 'agent-shell--update-header-and-mode-line)
+               #'ignore)
+              ((symbol-function 'agent-shell--emit-event)
+               (lambda (&rest args)
+                 (push args emitted))))
+      (agent-shell--on-notification
+       :state state
+       :acp-notification '((method . "session/update")
+                           (params
+                            (update
+                             (sessionUpdate . "config_option_update")
+                             (configOptions . [])
+                             (_meta (foo . "bar")))))))
+    (should (equal (plist-get (car emitted) :event) 'config-option-update))
+    (should (equal (map-elt (plist-get (car emitted) :data) :meta)
+                   '((foo . "bar"))))))
 
 (ert-deftest agent-shell--config-option-set-model-id-config-option-test ()
   "Test model changes prefer session config options."
@@ -2731,22 +2949,24 @@ fast: requesting on... done"))
 
 (ert-deftest agent-shell--make-transcript-frontmatter-test ()
   "Test `agent-shell--make-transcript-frontmatter' function."
-  ;; All fields present.
+  ;; All fields present.  Times render as unquoted YAML timestamps.
   (should (equal (agent-shell--make-transcript-frontmatter
-                  '(("agent" . "Claude")
-                    ("started" . "2025-11-02T18:17:41-05:00")
+                  `(("agent" . "Claude")
+                    ("started" . ,(encode-time '(41 17 18 2 11 2025 nil nil -18000)))
                     ("working_directory" . "/home/user/project/")
                     ("session_id" . "eb5b6105")
                     ("model" . "opus")))
-                 "---
+                 (format "---
 agent: \"Claude\"
-started: \"2025-11-02T18:17:41-05:00\"
+started: %s
 working_directory: \"/home/user/project/\"
 session_id: \"eb5b6105\"
 model: \"opus\"
 ---
 
-"))
+"
+                         (format-time-string "%FT%T%:z"
+                                             (encode-time '(41 17 18 2 11 2025 nil nil -18000))))))
   ;; Nil values omit their key entirely.
   (should (equal (agent-shell--make-transcript-frontmatter
                   '(("agent" . "Claude")
@@ -3898,6 +4118,37 @@ so the command must not append a second time."
       (when (and test-buffer (buffer-live-p test-buffer))
         (kill-buffer test-buffer)))))
 
+(ert-deftest agent-shell--start-function-strategy-kills-shell-on-cancel ()
+  "Cancelling a function strategy's session selection should kill the shell."
+  (let ((test-buffer nil)
+        (fake-process (start-process "fake-agent" nil "cat"))
+        (config (list (cons :buffer-name "test-agent")
+                      (cons :client-maker
+                            (lambda (_buf)
+                              (list (cons :command "cat")))))))
+    (unwind-protect
+        (cl-letf (((symbol-function 'shell-maker-start-v2)
+                   (lambda (&rest _args)
+                     (setq test-buffer (get-buffer-create "*test-agent-shell*"))
+                     (with-current-buffer test-buffer
+                       (setq major-mode 'agent-shell-mode))
+                     test-buffer))
+                  ((symbol-function 'shell-maker--process) (lambda () fake-process))
+                  ((symbol-function 'agent-shell--finish-output) #'ignore)
+                  ((symbol-function 'agent-shell--handle) #'ignore)
+                  (agent-shell-file-completion-enabled nil))
+          (let* ((agent-shell-session-strategy (lambda (_context) 'prompt))
+                 (shell-buffer (agent-shell--start :config config
+                                                   :no-focus t
+                                                   :new-session t)))
+            (with-current-buffer shell-buffer
+              (agent-shell--emit-event :event 'session-selection-cancelled))
+            (should-not (buffer-live-p shell-buffer))))
+      (when (process-live-p fake-process)
+        (delete-process fake-process))
+      (when (and test-buffer (buffer-live-p test-buffer))
+        (kill-buffer test-buffer)))))
+
 (ert-deftest agent-shell--list-sessions-fetches-all-pages-test ()
   "Test `agent-shell--list-sessions' follows cursors through empty pages."
   (let ((agent-shell-session-list-page-limit nil)
@@ -4018,7 +4269,10 @@ so the command must not append a second time."
                   (new . "Couldn't resume session abc. Starting a new one.")
                   (new-deferred . "Couldn't resume session abc. Starting a new one.")))
     (let ((agent-shell-session-strategy (car case)))
-      (should (equal (agent-shell--resume-failure-message :session-id "abc") (cdr case))))))
+      (should (equal (agent-shell--resume-failure-message :session-id "abc") (cdr case)))))
+  (let ((agent-shell-session-strategy (lambda (_context) 'latest)))
+    (should (equal (agent-shell--resume-failure-message :session-id "abc")
+                   "Couldn't resume session abc. Choosing another session."))))
 
 (ert-deftest agent-shell--initiate-session-fork-by-id-resumes-fork-test ()
   "Test forking resumes the fork and stays on it if resuming fails."
@@ -4144,6 +4398,64 @@ so the command must not append a second time."
             (should (equal (map-elt load-params 'cwd) "/tmp"))))
         (should session-init-called)
         (should (equal (map-nested-elt agent-shell--state '(:session :id)) "session-123"))))))
+
+(ert-deftest agent-shell--initiate-session-function-strategy-loads-chosen-id ()
+  "Test a function `agent-shell-session-strategy' loads the session it names."
+  (with-temp-buffer
+    (let* ((received nil)
+           (agent-shell-session-strategy
+            (lambda (context)
+              (setq received (map-elt context :sessions))
+              '(session-id . "hidden-id")))
+           (requests '())
+           (session-init-called nil)
+           (state (list (cons :buffer (current-buffer))
+                        (cons :client 'test-client)
+                        (cons :session (list (cons :id nil)
+                                             (cons :mode-id nil)
+                                             (cons :modes nil)))
+                        (cons :supports-session-list t)
+                        (cons :supports-session-load t)
+                        (cons :pending-restore nil)
+                        (cons :active-requests nil)
+                        (cons :event-subscriptions nil))))
+      (setq-local agent-shell--state state)
+      (cl-letf (((symbol-function 'agent-shell--state)
+                 (lambda () agent-shell--state))
+                ((symbol-function 'agent-shell--update-fragment)
+                 (lambda (&rest _args) nil))
+                ((symbol-function 'agent-shell--update-header-and-mode-line)
+                 (lambda () nil))
+                ((symbol-function 'agent-shell-cwd)
+                 (lambda () "/tmp"))
+                ((symbol-function 'agent-shell--resolve-path)
+                 (lambda (path) path))
+                ((symbol-function 'agent-shell--mcp-servers)
+                 (lambda () []))
+                ((symbol-function 'acp-send-request)
+                 (lambda (&rest args)
+                   (push args requests)
+                   (pcase (map-elt (plist-get args :request) :method)
+                     ("session/list"
+                      (funcall (plist-get args :on-success)
+                               '((sessions . [((sessionId . "listed-id")
+                                               (cwd . "/tmp")
+                                               (title . "Listed session"))]))))
+                     ("session/load"
+                      (funcall (plist-get args :on-success) nil))
+                     (method (error "Unexpected method: %s" method))))))
+        (agent-shell--initiate-session
+         :shell-buffer (current-buffer)
+         :on-session-init (lambda ()
+                            (setq session-init-called t)))
+        (should (equal (mapcar (lambda (session) (map-elt session 'sessionId))
+                               received)
+                       '("listed-id")))
+        (let ((load-request (plist-get (car requests) :request)))
+          (should (equal (map-elt load-request :method) "session/load"))
+          (should (equal (map-nested-elt load-request '(:params sessionId))
+                         "hidden-id")))
+        (should session-init-called)))))
 
 (ert-deftest agent-shell--initiate-session-falls-back-to-new-on-list-failure ()
   "Test `agent-shell--initiate-session' falls back to session/new on list failure."
@@ -4326,8 +4638,35 @@ other unknown ones."
   (should-not (agent-shell--validate-session-strategy 'prompt))
   (should-error (agent-shell--validate-session-strategy 'new-deferred)
                 :type 'user-error)
+  (should-not (agent-shell--validate-session-strategy (lambda (_context) 'new)))
   (should-error (agent-shell--validate-session-strategy 'bogus)
                 :type 'user-error))
+
+(ert-deftest agent-shell--select-session-via-function-test ()
+  "Test `agent-shell--select-session-via-function' maps each return value."
+  (let* ((noninteractive t)
+         (session-a '((sessionId . "session-1") (title . "First")))
+         (session-b '((sessionId . "session-2") (title . "Second")))
+         (sessions (list session-a session-b))
+         (received nil))
+    ;; The function receives the sessions in its context.
+    (let ((agent-shell-session-strategy
+           (lambda (context) (setq received context) 'new)))
+      (should-not (agent-shell--select-session-via-function :acp-sessions sessions))
+      (should (equal received (list (cons :sessions sessions)))))
+    (dolist (case `((latest . ,session-a)
+                    ;; noninteractive prompt falls back to the first session.
+                    (prompt . ,session-a)
+                    ((session-id . "session-2") . ,session-b)
+                    ;; Unlisted sessions resume by ID alone.
+                    ((session-id . "hidden") . ((sessionId . "hidden")))))
+      (let ((agent-shell-session-strategy (lambda (_context) (car case))))
+        (should (equal (agent-shell--select-session-via-function :acp-sessions sessions)
+                       (cdr case)))))
+    (dolist (result '(nil bogus "session-1" (session-id . nil) (unknown . "x")))
+      (let ((agent-shell-session-strategy (lambda (_context) result)))
+        (should-error (agent-shell--select-session-via-function :acp-sessions sessions)
+                      :type 'user-error)))))
 
 (ert-deftest agent-shell--initiate-session-strategy-new-skips-list-load ()
   "Test `agent-shell--initiate-session' skips list/load when strategy is `new'."
@@ -5305,6 +5644,57 @@ Scaling an exact cent overshoots it, for example (* 0.07 100) is
                  (format "<tspan[^>]*fill=\"%s\"[^>]*>\\$0\\.43</tspan>"
                          (agent-shell--svg-fill-color 'agent-shell-secondary))
                  svg-data))))))
+
+(ert-deftest agent-shell--make-header-graphical-ignores-image-scaling-factor-test ()
+  "Test graphical header image is not scaled by `image-scaling-factor'.
+
+The header SVG is already sized in pixels, so automatic scaling on
+displays with wide default fonts would make it overflow the header line."
+  (skip-unless (image-type-available-p 'svg))
+  (with-temp-buffer
+    (setq-local agent-shell--state
+                `((:agent-config . ((:buffer-name . "Test")
+                                    (:icon-name . nil)))
+                  (:session . ((:id . "abc")
+                               (:model-id . nil)
+                               (:models . nil)
+                               (:mode-id . nil)
+                               (:modes . nil)))))
+    (cl-letf (((symbol-function 'agent-shell--state)
+               (lambda () agent-shell--state))
+              ((symbol-function 'agent-shell--context-usage-indicator)
+               (lambda () nil))
+              ((symbol-function 'agent-shell--busy-indicator-frame)
+               (lambda () nil))
+              ((symbol-function 'agent-shell--session-id-indicator)
+               (lambda () nil)))
+      (let* ((agent-shell-header-style 'graphical)
+             (agent-shell--header-cache nil)
+             (image-scaling-factor 2.0)
+             (header (agent-shell--make-header agent-shell--state))
+             (image (get-text-property 1 'display header)))
+        (should (eq (car-safe image) 'image))
+        (should (equal (image-property image :scale) 1))))))
+
+(ert-deftest agent-shell--config-icon-ignores-image-scaling-factor-test ()
+  "Test `agent-shell--config-icon' is not scaled by `image-scaling-factor'.
+
+The icon is sized to `frame-char-height', which is already in pixels, so
+automatic scaling on displays with wide default fonts would make it
+taller than a line."
+  (skip-unless (image-type-available-p 'svg))
+  (let ((icon-file (make-temp-file "agent-shell-icon" nil ".svg"
+                                   "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"/>")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell--make-agent-fallback-icon)
+                   (lambda (_name _width) icon-file)))
+          (let* ((image-scaling-factor 2.0)
+                 (icon (agent-shell--config-icon
+                        :config '((:buffer-name . "Test"))))
+                 (image (get-text-property 0 'display icon)))
+            (should (eq (car-safe image) 'image))
+            (should (equal (image-property image :scale) 1))))
+      (delete-file icon-file))))
 
 ;;; Tests for agent-shell--permission-title
 
@@ -6597,6 +6987,44 @@ Major-mode changes keep `buffer-undo-list', so each view page's
             (undo)
             (should (string-empty-p (buffer-string)))))
       (kill-buffer viewport-buffer))))
+
+(ert-deftest agent-shell-viewport--show-buffer-displays-after-populating-test ()
+  "The display action sees the viewport's compose content, not stale content.
+
+Display actions sizing the window to its buffer (e.g. a `window-height'
+function calling `fit-window-to-buffer') otherwise measure a page left
+over from view mode."
+  (let* ((agent-shell-file-completion-enabled nil)
+         (shell-buffer (generate-new-buffer "*agent-shell display test*"))
+         (viewport-buffer (generate-new-buffer "*agent-shell display test* [viewport]"))
+         (seen nil)
+         (agent-shell-display-action
+          `(display-buffer-at-bottom
+            (window-height
+             . ,(lambda (window)
+                  (with-current-buffer (window-buffer window)
+                    (setq seen `((:mode . ,major-mode)
+                                 (:content . ,(buffer-string))))))))))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-viewport--buffer)
+                   (lambda (&rest _) viewport-buffer))
+                  ((symbol-function 'agent-shell-viewport--busy-p)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'agent-shell-viewport--position)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'agent-shell-viewport--update-header)
+                   (lambda (&rest _))))
+          (with-current-buffer viewport-buffer
+            (agent-shell-viewport-view-mode)
+            (agent-shell-viewport--initialize :prompt "old prompt\n" :response "old response"))
+          (save-window-excursion
+            (agent-shell-viewport--show-buffer :append "some context"
+                                               :shell-buffer shell-buffer))
+          (should (eq (map-elt seen :mode) 'agent-shell-viewport-edit-mode))
+          (should (string-match-p "some context" (map-elt seen :content)))
+          (should-not (string-match-p "old response" (map-elt seen :content))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
 
 (ert-deftest agent-shell--refresh-session-title-skips-when-list-unsupported ()
   "Test `agent-shell--refresh-session-title' sends no request without `list'.
@@ -8241,8 +8669,11 @@ belongs to `agent-shell-markdown-rerender-tables' /
 `agent-shell-markdown-rerender-images', so this hook must not gate on
 the window width being unchanged."
   (with-temp-buffer
-    (let ((scheduled 0))
+    (agent-shell--enable-realign)
+    (let ((scheduled 0)
+          (shell-buffer (current-buffer)))
       (cl-letf (((symbol-function 'window-live-p) (lambda (_) t))
+                ((symbol-function 'window-buffer) (lambda (_) shell-buffer))
                 ((symbol-function 'window-body-width) (lambda (&rest _) 800))
                 ((symbol-function 'run-with-idle-timer)
                  (lambda (&rest _) (setq scheduled (1+ scheduled)) 'timer)))
@@ -8252,6 +8683,46 @@ the window width being unchanged."
         ;; stale, so this must still schedule.
         (agent-shell--realign-on-change 'window)
         (should (= scheduled 2))))))
+
+(ert-deftest agent-shell--realign-on-change-targets-window-buffer ()
+  "Schedule the re-align for the window's buffer, not the current one.
+Regression (#934): before Emacs 31, buffer-local window change hooks
+run with whatever buffer redisplay had current, so a shell window
+resized while another window was selected scheduled the re-render
+for the selected window's buffer instead."
+  (let ((shell-buffer (generate-new-buffer "*realign-shell*"))
+        (other-buffer (generate-new-buffer "*realign-other*"))
+        (scheduled-for nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer shell-buffer
+            (agent-shell--enable-realign))
+          (cl-letf (((symbol-function 'window-live-p) (lambda (_) t))
+                    ((symbol-function 'run-with-idle-timer)
+                     (lambda (_secs _repeat _fn buffer)
+                       (push buffer scheduled-for)
+                       'timer)))
+            ;; Shell window resized while another buffer is current.
+            (cl-letf (((symbol-function 'window-buffer)
+                       (lambda (_) shell-buffer)))
+              (with-current-buffer other-buffer
+                (agent-shell--realign-on-change 'window)))
+            (should (equal scheduled-for (list shell-buffer)))
+            (should (eq (buffer-local-value 'agent-shell--realign-timer
+                                            shell-buffer)
+                        'timer))
+            (should-not (buffer-local-value 'agent-shell--realign-timer
+                                            other-buffer))
+            ;; Emacs 31 also runs the buffer-change hook for the shell
+            ;; buffer when it leaves a window now showing another buffer.
+            (setq scheduled-for nil)
+            (cl-letf (((symbol-function 'window-buffer)
+                       (lambda (_) other-buffer)))
+              (with-current-buffer shell-buffer
+                (agent-shell--realign-on-change 'window)))
+            (should-not scheduled-for)))
+      (kill-buffer shell-buffer)
+      (kill-buffer other-buffer))))
 
 (ert-deftest agent-shell--make-permission-actions-orders-allow-before-reject ()
   "Offer allowing before rejecting, whatever order the agent sent.

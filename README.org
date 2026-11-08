@@ -19,32 +19,32 @@ Thank you!
 
 =agent-shell= brings your favorite AI agents to [[https://www.gnu.org/software/emacs/][Emacs]], keeping you at home: familiar buffers and bindings, no terminal emulation. All powered by ACP, the [[https://agentclientprotocol.com][Agent Client Protocol]].
 
-Works with 23 agents today, and any other that speaks ACP:
+Works with 24 agents today, and any other that speaks ACP:
 
+- [[https://antigravity.google/docs/ide/extensions][Antigravity]] (Google)
+- [[https://docs.augmentcode.com/cli/overview][Auggie]]
 - [[https://code.claude.com/docs/en/overview][Claude Agent]] (Anthropic)
+- [[https://docs.cline.bot/usage/acp][Cline]]
+- [[https://www.codebuddy.ai][CodeBuddy]]
 - [[https://github.com/agentclientprotocol/codex-acp][Codex]] (OpenAI)
+- [[https://cursor.com/docs/cli][Cursor]]
+- [[https://github.com/deepseek-ai/deepseek-harness][DeepSeek Harness]]
+- [[https://factory.ai][Factory Droid]]
 - [[https://github.com/google-gemini/gemini-cli][Gemini CLI]] (Google)
+- [[https://docs.github.com/en/copilot/reference/copilot-cli-reference/acp-server][GitHub Copilot]]
 - [[https://goose-docs.ai/docs/getting-started/installation][Goose]]
 - [[https://docs.x.ai/docs/overview][Grok Build]] (xAI)
-- [[https://cursor.com/docs/cli][Cursor]]
-- [[https://docs.cline.bot/usage/acp][Cline]]
-- [[https://docs.github.com/en/copilot/reference/copilot-cli-reference/acp-server][GitHub Copilot]]
+- [[https://github.com/NousResearch/hermes-agent][Hermes]]
+- [[https://junie.jetbrains.com/docs/junie-cli-acp.html][Junie]] (JetBrains)
 - [[https://www.kimi.com/code][Kimi Code CLI]]
-- [[https://www.codebuddy.ai][CodeBuddy]]
-- [[https://github.com/deepseek-ai/deepseek-harness][DeepSeek Harness]]
 - [[https://kiro.dev][Kiro CLI]]
+- [[https://github.com/mistralai/mistral-vibe][Mistral Vibe]]
+- [[https://github.com/can1357/oh-my-pi][Oh My Pi]]
+- [[https://openclaw.ai][OpenClaw]]
+- [[https://opencode.ai][OpenCode]]
+- [[https://github.com/svkozak/pi-acp][Pi]]
 - [[https://qoder.com][Qoder CLI]]
 - [[https://github.com/QwenLM/qwen-code][Qwen Code]]
-- [[https://docs.augmentcode.com/cli/overview][Auggie]]
-- [[https://github.com/mistralai/mistral-vibe][Mistral Vibe]]
-- [[https://factory.ai][Factory Droid]]
-- [[https://github.com/svkozak/pi-acp][Pi]]
-- [[https://github.com/can1357/oh-my-pi][Oh My Pi]]
-- [[https://github.com/NousResearch/hermes-agent][Hermes]]
-- [[https://opencode.ai][OpenCode]]
-- [[https://openclaw.ai][OpenClaw]]
-- [[https://antigravity.google/docs/ide/extensions][Antigravity]] (Google)
-- [[https://junie.jetbrains.com/docs/junie-cli-acp.html][Junie]] (JetBrains)
 
 [[https://www.youtube.com/watch?v=R2Ucr3amgGg][agent-shell - YouTube]]
 
@@ -326,43 +326,13 @@ See https://github.com/can1357/oh-my-pi for details.
 
 *** Antigravity
 
-For Antigravity, download the =agy_acp_server= binary for your platform from the [[https://github.com/agentclientprotocol/registry/tree/main/antigravity-acp][ACP registry entry]] and make sure it's on your =PATH= (or set =agent-shell-antigravity-acp-command= to an absolute path).
+For Antigravity, install the Antigravity CLI and make sure =agy= is on your =PATH= (agent-shell runs =agy acp=). Sign in once via an interactive =agy= session or with:
 
-Alternatively, you can bootstrap the antigravity tool with the following function:
-
-#+begin_src emacs-lisp
-  (defun agent-shell-antigravity-bootstrap (&optional force)
-    "Download and install the latest Antigravity ACP server binary."
-    (interactive "P")
-    (let* ((arch (pcase (car (split-string system-configuration "-"))
-                   ((or "x86_64" "amd64") "x86_64")
-                   ((or "aarch64" "arm64") "aarch64")
-                   (a a)))
-           (os (pcase system-type ('darwin "darwin") ('windows-nt "windows") (_ "linux")))
-           (platform (format "%s-%s" os arch))
-           (install-dir (agent-shell-cache-dir "antigravity" platform))
-           (bin-name (file-name-nondirectory (car agent-shell-antigravity-acp-command)))
-           (bin-path (expand-file-name bin-name install-dir)))
-      (unless (and (not force) (file-executable-p bin-path))
-        (message "Antigravity: bootstrapping server for %s..." platform)
-        (make-directory install-dir t)
-        (let* ((reg-url "https://raw.githubusercontent.com/agentclientprotocol/registry/main/antigravity-acp/agent.json")
-               (reg (with-temp-buffer
-                      (url-insert-file-contents reg-url)
-                      (json-parse-buffer :object-type 'alist)))
-               (archive-url (map-nested-elt reg `(distribution binary ,(intern platform) archive)))
-               (zip (expand-file-name "server.zip" install-dir)))
-          (url-copy-file archive-url zip t)
-          (call-process "unzip" nil nil nil "-o" "-q" zip "-d" install-dir)
-          (delete-file zip)
-          (set-file-modes bin-path #o755)))
-      (setq agent-shell-antigravity-acp-command
-            (cons bin-path (cdr agent-shell-antigravity-acp-command)))
-      (message "Antigravity: using ACP server at %s" bin-path)
-      bin-path))
+#+begin_src bash
+agy acp --login
 #+end_src
 
-See https://antigravity.google/docs/ide/extensions for details.
+See https://antigravity.google/docs/ide/extensions/acp for details.
 
 *** OpenClaw
 
@@ -1087,6 +1057,17 @@ All of the above settings can be applied on a per-project basis using [[https://
                   ("C-c C-k" . agent-shell-interrupt)))
   #+end_src
 
+*** Folding sections
+
+Thoughts, tool calls, user messages and activity groups fold under their header line. With point on a header:
+
+- =RET= (or click) - Expand or collapse the section.
+- =C-u RET= - Expand or collapse the section's activity group, along with every section inside it.
+
+These keys only apply on headers, so =RET= still submits the prompt everywhere else. To fold with other keys, add them to =agent-shell-ui-fragment-map=.
+
+Use =M-x agent-shell-ui-toggle-all-fragments= to expand or collapse every section in the buffer.
+
 *** Session controls
 
 When the active agent advertises the corresponding session option, you can switch it from the shell buffer:
@@ -1097,6 +1078,8 @@ When the active agent advertises the corresponding session option, you can switc
 - =C-<tab>= - Cycle session mode.
 
 The current selections are shown in the header right after the agent name; click any segment to open a popup menu. The thought level segment only appears for models that expose it (e.g. Claude Sonnet/Opus with effort levels; Codex's reasoning_effort).
+
+Any other options the agent advertises (e.g. Codex's speed) are counted after the header settings as =(+N)=; click it to change them. They are also appended to the graphical header's settings menu. =C-c C-s= sets any of them from the keyboard.
 
 From the viewport (=agent-shell-viewport-view-mode= / =agent-shell-viewport-edit-mode=), the same controls are bound to:
 
