@@ -52,8 +52,15 @@ variable `exec-path'."
   "Environment variables for the Antigravity ACP server.
 
 This should be a list of environment variables to be used when
-starting the Antigravity agent process."
-  :type '(repeat string)
+starting the Antigravity agent process.
+
+A value given as a function is resolved each time the agent starts,
+rather than when this variable is set.  See
+`agent-shell-make-environment-variables'."
+  :type '(repeat (choice (string :tag "NAME=VALUE")
+                         (cons :tag "Resolved at agent start"
+                               (string :tag "Name")
+                               (function :tag "Value function"))))
   :group 'agent-shell)
 
 (cl-defun agent-shell-antigravity-make-authentication (&key login api-key business agent-platform none)
@@ -128,6 +135,27 @@ For no authentication (when managed externally):
         (t
          nil)))
 
+(defcustom agent-shell-antigravity-default-config-options
+  nil
+  "Default Antigravity config options, applied at session start.
+
+An alist of (OPTION . VALUE).  Both are the ids listed under
+\"Available config options\" when starting a new shell, so whatever
+Antigravity advertises can be set here without further `agent-shell'
+changes.  OPTION also accepts the ACP category names (\"model\",
+\"mode\") for options carrying one.
+
+For example:
+
+  (setq agent-shell-antigravity-default-config-options
+        \\='((\"model\" . \"gemini-2.5-pro\")
+          (\"mode\" . \"auto\")))
+
+Options are applied in the order listed.  An option or value
+Antigravity does not offer is reported and skipped."
+  :type '(alist :key-type string :value-type string)
+  :group 'agent-shell)
+
 (defun agent-shell-antigravity-make-agent-config ()
   "Create an Antigravity agent configuration.
 
@@ -144,6 +172,7 @@ Returns an agent configuration alist using `agent-shell-make-agent-config'."
    :authenticate-request-maker #'agent-shell-antigravity--authenticate-request
    :client-maker (lambda (buffer)
                    (agent-shell-antigravity-make-client :buffer buffer))
+   :default-config-options (lambda () agent-shell-antigravity-default-config-options)
    :install-instructions "See https://antigravity.google/docs/ide/extensions/acp for installation."))
 
 (defun agent-shell-antigravity--authenticate-request ()
